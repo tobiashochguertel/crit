@@ -53,7 +53,7 @@ crit/
 ├── CHANGELOG.md
 ├── Taskfile.yml                      # build, test, lint, format, tidy, clean, all
 │                                     # init-claude, init-copilot, init-opencode
-├── go.mod                            # module github.com/kevindutra/crit
+├── go.mod                            # module github.com/tobiashochguertel/crit
 ├── go.sum
 ├── README.md                         # CLI usage; link to plugin repos for IDE setup
 │

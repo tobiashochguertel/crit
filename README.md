@@ -17,7 +17,7 @@ Built for the human-in-the-loop workflow: Claude writes code or a plan, you revi
 crit is available as a Claude Code plugin. Add the marketplace and install:
 
 ```
-/plugin marketplace add kevindutra/crit
+/plugin marketplace add tobiashochguertel/crit
 /plugin install crit
 ```
 
@@ -26,7 +26,7 @@ Then use `/crit:review` in Claude Code. It will ask whether you want to review c
 ### From source
 
 ```bash
-go install github.com/kevindutra/crit/cmd/crit@latest
+go install github.com/tobiashochguertel/crit/cmd/crit@latest
 ```
 
 Make sure `$GOPATH/bin` (defaults to `~/go/bin`) is in your `PATH`:

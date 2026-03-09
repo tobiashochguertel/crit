@@ -61,7 +61,7 @@ explains every directory and file.
 │       ├── repository-structure-alt1-monorepo.md    # Alternative: monorepo layout
 │       └── repository-structure-alt2-multi-repo.md  # Alternative: split repositories
 │
-├── go.mod                             # Go module definition (module path: github.com/kevindutra/crit)
+├── go.mod                             # Go module definition (module path: github.com/tobiashochguertel/crit)
 ├── go.sum                             # Dependency checksums (auto-managed by go toolchain)
 │
 ├── internal/                          # All Go application code (not exported)

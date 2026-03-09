@@ -51,7 +51,7 @@ the explanation of the layer label scheme.
 │   │   ├── CHANGELOG.md                   #   Version history (moved from root)
 │   │   ├── Taskfile.yml                   #   build, test, lint, format, tidy, clean, all
 │   │   │                                  #   init-claude, init-copilot, init-opencode  (optional)
-│   │   ├── go.mod                         #   module github.com/kevindutra/crit (path unchanged)
+│   │   ├── go.mod                         #   module github.com/tobiashochguertel/crit (path unchanged)
 │   │   ├── go.sum
 │   │   │
 │   │   ├── cmd/

@@ -11,7 +11,7 @@ Review code changes using crit's multi-file code review TUI.
 The `crit` binary must be installed and on PATH. If not installed:
 
 ```bash
-go install github.com/kevindutra/crit/cmd/crit@latest
+go install github.com/tobiashochguertel/crit/cmd/crit@latest
 ```
 
 ## Step 1: Ask the user to run the TUI

@@ -5,19 +5,52 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 // Compile-time fallback values for repo coordinates.
-// Override at runtime with CRIT_GITHUB_OWNER, CRIT_GITHUB_REPO, CRIT_GITHUB_BRANCH.
+// Override at runtime via (in priority order):
+//  1. CRIT_GITHUB_OWNER / CRIT_GITHUB_REPO / CRIT_GITHUB_BRANCH env vars
+//  2. `git remote get-url origin` auto-detection
+//  3. These compile-time constants.
 const (
 	DefaultRepoOwner  = "tobiashochguertel"
 	DefaultRepoName   = "crit"
 	DefaultRepoBranch = "main"
 )
+
+// reGitHubRemote matches both HTTPS and SSH GitHub remote URLs and captures
+// the owner and repository name.
+//
+//nolint:gochecknoglobals
+var reGitHubRemote = regexp.MustCompile(`github\.com[/:]([^/]+)/([^/\.]+?)(?:\.git)?$`)
+
+// parseGitHubURL extracts the (owner, repo) pair from a GitHub remote URL.
+// Supports both HTTPS (https://github.com/owner/repo.git) and SSH
+// (git@github.com:owner/repo.git) formats.  Returns empty strings on failure.
+func parseGitHubURL(rawURL string) (owner, repo string) {
+	m := reGitHubRemote.FindStringSubmatch(strings.TrimSpace(rawURL))
+	if len(m) < 3 {
+		return "", ""
+	}
+	return m[1], m[2]
+}
+
+// gitRemoteCoords runs `git remote get-url origin` in the current working
+// directory and returns the parsed (owner, repo).  Returns empty strings if
+// the command fails or the URL is not a recognisable GitHub URL.
+func gitRemoteCoords() (owner, repo string) {
+	out, err := exec.Command("git", "remote", "get-url", "origin").Output()
+	if err != nil {
+		return "", ""
+	}
+	return parseGitHubURL(string(out))
+}
 
 // envOrDefault returns the value of the named environment variable, or fallback
 // if the variable is unset or empty.
@@ -28,13 +61,41 @@ func envOrDefault(key, fallback string) string {
 	return fallback
 }
 
-// defaultBase returns the GitHub raw-content base URL computed from env vars
-// (CRIT_GITHUB_OWNER, CRIT_GITHUB_REPO, CRIT_GITHUB_BRANCH), falling back to
-// DefaultRepoOwner, DefaultRepoName, DefaultRepoBranch.
+// defaultBase returns the GitHub raw-content base URL using a three-level
+// priority chain:
+//
+//  1. CRIT_GITHUB_OWNER / CRIT_GITHUB_REPO / CRIT_GITHUB_BRANCH env vars.
+//  2. Auto-detection from `git remote get-url origin` (useful when crit is
+//     run inside a fork of the crit repository).
+//  3. Compile-time constants (DefaultRepoOwner / DefaultRepoName / DefaultRepoBranch).
 func defaultBase() string {
-	owner := envOrDefault("CRIT_GITHUB_OWNER", DefaultRepoOwner)
-	repo := envOrDefault("CRIT_GITHUB_REPO", DefaultRepoName)
-	branch := envOrDefault("CRIT_GITHUB_BRANCH", DefaultRepoBranch)
+	owner := os.Getenv("CRIT_GITHUB_OWNER")
+	repo := os.Getenv("CRIT_GITHUB_REPO")
+	branch := os.Getenv("CRIT_GITHUB_BRANCH")
+
+	// Level 2: auto-detect from git remote when env vars are absent.
+	if owner == "" || repo == "" {
+		if o, r := gitRemoteCoords(); o != "" && r != "" {
+			if owner == "" {
+				owner = o
+			}
+			if repo == "" {
+				repo = r
+			}
+		}
+	}
+
+	// Level 3: compile-time fallbacks.
+	if owner == "" {
+		owner = DefaultRepoOwner
+	}
+	if repo == "" {
+		repo = DefaultRepoName
+	}
+	if branch == "" {
+		branch = DefaultRepoBranch
+	}
+
 	return fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s", owner, repo, branch)
 }
 

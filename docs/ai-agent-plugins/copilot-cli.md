@@ -91,6 +91,6 @@ The `crit-code-review` and `crit-plan-review` skills work differently from typic
 
 **Skill not found:** Ensure `~/.copilot/skills/` contains the `SKILL.md` files. Re-run `crit setup-copilot --force`.
 
-**`crit` not found:** Install with `go install github.com/kevindutra/crit/cmd/crit@latest` or via your package manager.
+**`crit` not found:** Install with `go install github.com/tobiashochguertel/crit/cmd/crit@latest` or via your package manager.
 
 **tmux integration:** `crit review --code --detach --wait` requires tmux. If you're not in a tmux session, the skill will fall back to asking you to run the command manually.

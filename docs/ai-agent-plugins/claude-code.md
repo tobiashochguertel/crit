@@ -55,7 +55,7 @@ If you prefer not to use the Plugin Marketplace, install `crit` and run the setu
 ### Install the binary
 
 ```bash
-go install github.com/kevindutra/crit/cmd/crit@latest
+go install github.com/tobiashochguertel/crit/cmd/crit@latest
 # or from the fork (includes copilot/opencode support):
 go install github.com/tobiashochguertel/crit/cmd/crit@latest
 ```
@@ -189,8 +189,8 @@ The marketplace plugin manifest at `plugin/crit/.claude-plugin/plugin.json`:
   "description": "Review markdown documents with an interactive TUI. Leave inline comments, then let Claude address the feedback automatically.",
   "version": "1.0.2",
   "author": { "name": "Kevin Dutra" },
-  "homepage": "https://github.com/kevindutra/crit",
-  "repository": "https://github.com/kevindutra/crit",
+  "homepage": "https://github.com/tobiashochguertel/crit",
+  "repository": "https://github.com/tobiashochguertel/crit",
   "license": "MIT",
   "keywords": ["review", "markdown", "tui", "diff", "critique"],
   "skills": "skills/"

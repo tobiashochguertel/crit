@@ -112,6 +112,6 @@ When you invoke `/crit-code-review`, opencode sends the command's Markdown conte
 
 **Command not found:** Ensure `~/.config/opencode/commands/` contains the `.md` files. Re-run `crit setup-opencode --force`.
 
-**`crit` not found:** Install with `go install github.com/kevindutra/crit/cmd/crit@latest`.
+**`crit` not found:** Install with `go install github.com/tobiashochguertel/crit/cmd/crit@latest`.
 
 **opencode not finding project commands:** Ensure you're running `opencode` from the project root (where `.opencode/commands/` is located).

@@ -13,7 +13,7 @@ Review the document at `$ARGUMENTS` using crit's interactive TUI.
 The `crit` binary must be installed and on PATH. If not installed:
 
 ```bash
-go install github.com/kevindutra/crit/cmd/crit@latest
+go install github.com/tobiashochguertel/crit/cmd/crit@latest
 ```
 
 ## Step 1: Launch the TUI

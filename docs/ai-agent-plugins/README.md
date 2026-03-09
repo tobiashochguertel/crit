@@ -14,7 +14,7 @@
 
 ```bash
 # Install crit
-go install github.com/kevindutra/crit/cmd/crit@latest
+go install github.com/tobiashochguertel/crit/cmd/crit@latest
 
 # Set up for your preferred AI agent
 crit setup-claude      # Claude Code (global)
@@ -48,7 +48,7 @@ All three agents get the same review workflow:
 crit is available in the Claude Code Plugin Marketplace. To install via the marketplace instead of the CLI:
 
 ```
-/plugin install https://github.com/kevindutra/crit
+/plugin install https://github.com/tobiashochguertel/crit
 ```
 
 or using `tobiashochguertel`'s fork (includes copilot/opencode support):
