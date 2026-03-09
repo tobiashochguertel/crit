@@ -112,3 +112,8 @@ tasks:
           echo "Fix: cd packages/copilot && ln -s ../claude-code/skills skills"
           exit 1
         fi
+
+  show-config:
+    desc: Show the effective source URLs derived from env vars / git remote
+    dir: "{{.CLI_DIR}}"
+    cmds: [task show-config]

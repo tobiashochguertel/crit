@@ -18,9 +18,9 @@ archives:
 
 brews:
   - repository:
-      owner: kevindutra
+      owner: "{{ .Repo.Owner }}"
       name: homebrew-tap
-    homepage: "https://github.com/kevindutra/crit"
+    homepage: "https://github.com/{{ .Repo.Owner }}/{{ .Repo.Name }}"
     description: "Terminal review tool for markdown documents"
     license: "MIT"
     install: |

@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
-	"github.com/kevindutra/crit/internal/document"
+	"github.com/tobiashochguertel/crit/internal/document"
 	"gopkg.in/yaml.v3"
 )
 

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/kevindutra/crit/internal/document"
+	"github.com/tobiashochguertel/crit/internal/document"
 )
 
 func TestStoreRoundTrip(t *testing.T) {

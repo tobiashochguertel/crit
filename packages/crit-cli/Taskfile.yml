@@ -4,6 +4,18 @@ vars:
   BINARY: crit
   CMD_PKG: ./cmd/crit
   BUILD_DIR: dist
+  # ---------------------------------------------------------------------------
+  # Auto-detect GitHub repository coordinates from the git remote, so that
+  # init-* tasks use skills/commands from the developer's own fork and branch.
+  # Any of these can be overridden by setting the env var before running task:
+  #   CRIT_GITHUB_OWNER=myname task init-claude
+  # ---------------------------------------------------------------------------
+  GIT_OWNER:
+    sh: echo "${CRIT_GITHUB_OWNER:-$(git remote get-url origin 2>/dev/null | sed -E 's|.*github\.com[/:]([^/]+)/.*|\1|' || echo 'tobiashochguertel')}"
+  GIT_REPO:
+    sh: echo "${CRIT_GITHUB_REPO:-$(git remote get-url origin 2>/dev/null | sed -E 's|.*github\.com[/:]([^/]+)/([^/.]+)(\.git)?$|\2|' || echo 'crit')}"
+  GIT_BRANCH:
+    sh: echo "${CRIT_GITHUB_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'main')}"
 
 tasks:
   default:
@@ -71,20 +83,49 @@ tasks:
   init-claude:
     desc: Install Claude Code skills for this project (requires a build first)
     deps: [build]
+    env:
+      CRIT_GITHUB_OWNER: "{{.GIT_OWNER}}"
+      CRIT_GITHUB_REPO: "{{.GIT_REPO}}"
+      CRIT_GITHUB_BRANCH: "{{.GIT_BRANCH}}"
     cmds:
       - ./{{.BUILD_DIR}}/{{.BINARY}} setup-claude --project --force
 
   init-copilot:
     desc: Install GitHub Copilot CLI skills for this project (requires a build first)
     deps: [build]
+    env:
+      CRIT_GITHUB_OWNER: "{{.GIT_OWNER}}"
+      CRIT_GITHUB_REPO: "{{.GIT_REPO}}"
+      CRIT_GITHUB_BRANCH: "{{.GIT_BRANCH}}"
     cmds:
       - ./{{.BUILD_DIR}}/{{.BINARY}} setup-copilot --project --force
 
   init-opencode:
     desc: Install opencode commands for this project (requires a build first)
     deps: [build]
+    env:
+      CRIT_GITHUB_OWNER: "{{.GIT_OWNER}}"
+      CRIT_GITHUB_REPO: "{{.GIT_REPO}}"
+      CRIT_GITHUB_BRANCH: "{{.GIT_BRANCH}}"
     cmds:
       - ./{{.BUILD_DIR}}/{{.BINARY}} setup-opencode --project --force
+
+  show-config:
+    desc: Show the effective source URLs that the built binary would use
+    cmds:
+      - |
+        OWNER="{{.GIT_OWNER}}"
+        REPO="{{.GIT_REPO}}"
+        BRANCH="{{.GIT_BRANCH}}"
+        BASE="https://raw.githubusercontent.com/${OWNER}/${REPO}/${BRANCH}"
+        echo "Repository coordinates:"
+        echo "  CRIT_GITHUB_OWNER  = ${OWNER}"
+        echo "  CRIT_GITHUB_REPO   = ${REPO}"
+        echo "  CRIT_GITHUB_BRANCH = ${BRANCH}"
+        echo ""
+        echo "Effective default URLs (override with CRIT_SKILLS_DIR / CRIT_OPENCODE_DIR):"
+        echo "  Skills:   ${BASE}/packages/claude-code/skills"
+        echo "  Commands: ${BASE}/packages/opencode/commands"
 
   all:
     desc: Format, lint, test, and build

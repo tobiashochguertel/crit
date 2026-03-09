@@ -5,8 +5,8 @@
   "author": {
     "name": "Kevin Dutra"
   },
-  "homepage": "https://github.com/kevindutra/crit",
-  "repository": "https://github.com/kevindutra/crit",
+  "homepage": "https://github.com/tobiashochguertel/crit",
+  "repository": "https://github.com/tobiashochguertel/crit",
   "license": "MIT",
   "keywords": ["review", "markdown", "tui", "diff", "critique"],
   "skills": "skills/"

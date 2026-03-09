@@ -16,9 +16,9 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/google/uuid"
 
-	"github.com/kevindutra/crit/internal/document"
-	gitpkg "github.com/kevindutra/crit/internal/git"
-	"github.com/kevindutra/crit/internal/review"
+	"github.com/tobiashochguertel/crit/internal/document"
+	gitpkg "github.com/tobiashochguertel/crit/internal/git"
+	"github.com/tobiashochguertel/crit/internal/review"
 )
 
 type pane int

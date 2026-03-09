@@ -11,14 +11,47 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// DefaultSkillsURL is the base raw-content URL for the canonical skill files
-// (SKILL.md files used by Claude Code and Copilot CLI).
-// Individual files are fetched by appending "/<skill-dir>/SKILL.md".
-const DefaultSkillsURL = "https://raw.githubusercontent.com/tobiashochguertel/crit/feature/multi-agent-plugin-support/packages/claude-code/skills"
+// Compile-time fallback values for repo coordinates.
+// Override at runtime with CRIT_GITHUB_OWNER, CRIT_GITHUB_REPO, CRIT_GITHUB_BRANCH.
+const (
+	DefaultRepoOwner  = "tobiashochguertel"
+	DefaultRepoName   = "crit"
+	DefaultRepoBranch = "main"
+)
 
-// DefaultCommandsURL is the base raw-content URL for the canonical opencode
-// command files.  Individual files are fetched by appending "/<cmd>.md".
-const DefaultCommandsURL = "https://raw.githubusercontent.com/tobiashochguertel/crit/feature/multi-agent-plugin-support/packages/opencode/commands"
+// envOrDefault returns the value of the named environment variable, or fallback
+// if the variable is unset or empty.
+func envOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// defaultBase returns the GitHub raw-content base URL computed from env vars
+// (CRIT_GITHUB_OWNER, CRIT_GITHUB_REPO, CRIT_GITHUB_BRANCH), falling back to
+// DefaultRepoOwner, DefaultRepoName, DefaultRepoBranch.
+func defaultBase() string {
+	owner := envOrDefault("CRIT_GITHUB_OWNER", DefaultRepoOwner)
+	repo := envOrDefault("CRIT_GITHUB_REPO", DefaultRepoName)
+	branch := envOrDefault("CRIT_GITHUB_BRANCH", DefaultRepoBranch)
+	return fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s", owner, repo, branch)
+}
+
+// DefaultSkillsURL is the effective base URL for skill files (SKILL.md, manifest.yaml).
+// Computed once at startup from CRIT_GITHUB_OWNER / CRIT_GITHUB_REPO / CRIT_GITHUB_BRANCH
+// env vars with compile-time fallbacks.  To override the URL entirely (e.g. a local
+// path or a different service), set CRIT_SKILLS_DIR instead.
+//
+//nolint:gochecknoglobals
+var DefaultSkillsURL = defaultBase() + "/packages/claude-code/skills"
+
+// DefaultCommandsURL is the effective base URL for opencode command files.
+// Computed once at startup from the same env vars as DefaultSkillsURL.
+// Override entirely with CRIT_OPENCODE_DIR.
+//
+//nolint:gochecknoglobals
+var DefaultCommandsURL = defaultBase() + "/packages/opencode/commands"
 
 // Config holds crit's persistent configuration, stored in
 // ~/.config/crit/config.yaml (XDG) or ~/.crit.yaml (fallback).
