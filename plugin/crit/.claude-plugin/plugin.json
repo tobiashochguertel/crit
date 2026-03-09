@@ -8,5 +8,6 @@
   "homepage": "https://github.com/kevindutra/crit",
   "repository": "https://github.com/kevindutra/crit",
   "license": "MIT",
-  "keywords": ["review", "markdown", "tui", "diff", "critique"]
+  "keywords": ["review", "markdown", "tui", "diff", "critique"],
+  "skills": "skills/"
 }
