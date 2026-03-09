@@ -68,6 +68,24 @@ tasks:
     cmds:
       - rm -rf {{.BUILD_DIR}}
 
+  init-claude:
+    desc: Install Claude Code skills for this project (requires a build first)
+    deps: [build]
+    cmds:
+      - ./{{.BUILD_DIR}}/{{.BINARY}} setup-claude --project --force
+
+  init-copilot:
+    desc: Install GitHub Copilot CLI skills for this project (requires a build first)
+    deps: [build]
+    cmds:
+      - ./{{.BUILD_DIR}}/{{.BINARY}} setup-copilot --project --force
+
+  init-opencode:
+    desc: Install opencode commands for this project (requires a build first)
+    deps: [build]
+    cmds:
+      - ./{{.BUILD_DIR}}/{{.BINARY}} setup-opencode --project --force
+
   all:
     desc: Format, lint, test, and build
     cmds:

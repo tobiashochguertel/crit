@@ -17,23 +17,17 @@ explains every directory and file.
 .
 ├── .claude-plugin/                    # [Layer A] Makes this repo a Claude Code MARKETPLACE
 │   ├── marketplace.json               #   Declares this repo as a marketplace; lists plugin sources
-│   └── plugin.json                    #   Fallback: lets the repo be installed as a plugin directly
+│   └── plugin.json                    #   [Layer A:claude-code] Fallback: direct plugin install
 │
 ├── .github/
 │   └── workflows/
 │       └── release.yml                # GoReleaser GitHub Actions workflow for tagged releases
 │
-├── .gitignore                         # Ignores built binaries (/crit, dist/), .task/, .claude/
+├── .gitignore                         # Ignores /crit, dist/, .task/, .claude/, .opencode/
 │
 ├── .goreleaser.yaml                   # GoReleaser config: cross-platform build + GitHub release
 │
 ├── .mise.toml                         # Pins Go version (1.24.2) for mise version manager
-│
-├── .opencode/                         # [Layer E] opencode commands for developing crit ITSELF
-│   └── commands/
-│       ├── crit-review.md             #   Route between code-review and plan-review modes
-│       ├── crit-code-review.md        #   Run a code review with crit (for crit contributors)
-│       └── crit-plan-review.md        #   Run a plan/doc review with crit (for crit contributors)
 │
 ├── assets/
 │   └── crit_logo.png                  # Logo used in README
@@ -42,7 +36,7 @@ explains every directory and file.
 │   └── crit/
 │       └── main.go                    # Binary entry point; calls cli.Execute()
 │
-├── commands/                          # [Layer A] Claude Code slash commands for the ROOT plugin
+├── commands/                          # [Layer A:claude-code] Slash commands for the ROOT plugin
 │   ├── review.md                      #   /review  — routes to code or plan review
 │   ├── code-review.md                 #   /code-review — multi-file code review
 │   └── plan-review.md                 #   /plan-review  — document/plan review
@@ -59,33 +53,37 @@ explains every directory and file.
 ├── docs/
 │   ├── ai-agent-plugins/              # Documentation for multi-agent plugin support
 │   │   ├── README.md                  #   Overview of supported AI agents
+│   │   ├── claude-code.md             #   Claude Code plugin setup guide
 │   │   ├── copilot-cli.md             #   GitHub Copilot CLI plugin setup guide
 │   │   └── opencode.md                #   opencode command setup guide
 │   └── spec/
-│       └── repository-structure.md    # THIS FILE — annotated repo map
+│       ├── repository-structure.md              # THIS FILE — annotated repo map
+│       ├── repository-structure-alt1-monorepo.md    # Alternative: monorepo layout
+│       └── repository-structure-alt2-multi-repo.md  # Alternative: split repositories
 │
 ├── go.mod                             # Go module definition (module path: github.com/kevindutra/crit)
 ├── go.sum                             # Dependency checksums (auto-managed by go toolchain)
 │
 ├── internal/                          # All Go application code (not exported)
 │   ├── cli/
-│   │   ├── opencode/                  # [Layer D] opencode command files EMBEDDED in the binary
+│   │   ├── opencode/                  # [Layer C:opencode] opencode command files EMBEDDED in binary
 │   │   │   ├── crit-review.md         #   Installed to ~/.config/opencode/commands/ by setup-opencode
 │   │   │   ├── crit-code-review.md    #   (global) or .opencode/commands/ (--project)
 │   │   │   └── crit-plan-review.md
 │   │   │
-│   │   ├── skill/                     # [Layer C] SKILL.md files EMBEDDED in the binary
+│   │   ├── skill/                     # [Layer C:claude-code] [Layer C:copilot] SKILL.md files EMBEDDED in binary
 │   │   │   ├── crit-review/
 │   │   │   │   └── SKILL.md           #   Installed to ~/.claude/skills/ by setup-claude
-│   │   │   ├── crit-code-review/
-│   │   │   │   └── SKILL.md           #   (global) or .claude/skills/ (--project)
+│   │   │   ├── crit-code-review/      #   (global) or .claude/skills/ (--project)
+│   │   │   │   └── SKILL.md           #   Also used by setup-copilot → ~/.copilot/skills/
 │   │   │   └── crit-plan-review/
-│   │   │       └── SKILL.md           #   Also used by setup-copilot for GitHub Copilot CLI
+│   │   │       └── SKILL.md
 │   │   │
 │   │   ├── comment.go                 # Comment data model and serialization
 │   │   ├── review.go                  # `crit review` command implementation
 │   │   ├── review_test.go
 │   │   ├── root.go                    # Root cobra command + persistent flags
+│   │   ├── setup.go                   # Shared installer helpers (resolveTargetDir, installSkills, …)
 │   │   ├── setup_claude.go            # `crit setup-claude` — installs skills for Claude Code
 │   │   ├── setup_copilot.go           # `crit setup-copilot` — installs skills for GitHub Copilot CLI
 │   │   ├── setup_opencode.go          # `crit setup-opencode` — installs commands for opencode
@@ -115,14 +113,14 @@ explains every directory and file.
 │       └── styles.go                  # Lipgloss style definitions
 │
 ├── plugin/
-│   └── crit/                          # [Layer B] The INSTALLABLE plugin package
+│   └── crit/                          # [Layer B:claude-code] The INSTALLABLE plugin package
 │       ├── .claude-plugin/
-│       │   └── plugin.json            #   Plugin manifest for the marketplace-installed plugin
+│       │   └── plugin.json            #   Plugin manifest consumed by Claude Code after install
 │       ├── commands/                  #   Slash commands installed to ~/.claude/plugins/crit/commands/
 │       │   ├── review.md
 │       │   ├── code-review.md
 │       │   └── plan-review.md
-│       └── skills/                    # [Layer B+] Copilot CLI skills inside the plugin
+│       └── skills/                    # [Layer B:copilot] Copilot CLI skills inside the plugin
 │           ├── crit-review/
 │           │   └── SKILL.md           #   Discoverable by GitHub Copilot CLI via plugin.json "skills"
 │           ├── crit-code-review/
@@ -131,86 +129,85 @@ explains every directory and file.
 │               └── SKILL.md
 │
 ├── README.md                          # Project documentation and install instructions
-└── Taskfile.yml                       # Dev task runner: build, test, lint, format, tidy, clean, all
+└── Taskfile.yml                       # Dev tasks: build, test, lint, format, tidy, clean, all
+                                       #            init-claude, init-copilot, init-opencode
 ```
 
-## The Five Installation Layers
+> **Note — `.opencode/` is git-ignored.**  Run `task init-opencode` to create
+> `.opencode/commands/` locally.  These project-local opencode commands
+> are labelled **[Layer D:opencode]** in the design documents; they are not
+> committed because each developer may use a different AI agent tool.
+
+## The Installation Layers
 
 Understanding the structure requires knowing **who installs what, where, and for whom**.
+The layer labels follow the pattern `[Layer X:agent]` — the same letter means the same
+_kind_ of artifact; the agent suffix says _which tool_ it targets.
 
-### Layer A — Root plugin (repo-as-plugin / marketplace host)
+### Layer A — Marketplace host and direct plugin entry point
 
-| Directory | Purpose |
-|-----------|---------|
-| `.claude-plugin/marketplace.json` | Declares this repo a **Claude Code marketplace**. When a user runs `/plugin marketplace add tobiashochguertel/crit`, Claude Code reads this file to discover available plugins. It points to `./plugin/crit` as the plugin source. |
-| `.claude-plugin/plugin.json` | Allows the repo to also be installed **directly** as a plugin (without going through a marketplace). The slash commands in `commands/` are used in this mode. |
-| `commands/` | Slash commands (`/review`, `/code-review`, `/plan-review`) available when the repo is used as a direct plugin. Content mirrors `plugin/crit/commands/` but serves this alternate install path. |
+| Path | Label | Purpose |
+|------|-------|---------|
+| `.claude-plugin/marketplace.json` | `[Layer A]` | Declares this repo a **Claude Code marketplace**. Running `/plugin marketplace add tobiashochguertel/crit` makes Claude Code read this file to find plugins. |
+| `.claude-plugin/plugin.json` | `[Layer A:claude-code]` | Allows the repo to be installed **directly** as a plugin (without a marketplace). |
+| `commands/` | `[Layer A:claude-code]` | Slash commands available when the repo is used as a direct plugin (`/review`, `/code-review`, `/plan-review`). |
 
-### Layer B — Marketplace-installed plugin (`plugin/crit/`)
+### Layer B — Marketplace-installed package
 
-When a user installs via `/plugin install crit`, Claude Code copies `plugin/crit/` to
-`~/.claude/plugins/crit/`.  Everything inside this directory is what the user receives:
+| Path | Label | Purpose |
+|------|-------|---------|
+| `plugin/crit/` | `[Layer B:claude-code]` | The installable plugin directory. Claude Code copies this to `~/.claude/plugins/crit/` on `/plugin install crit`. |
+| `plugin/crit/commands/` | `[Layer B:claude-code]` | Slash commands available after plugin install. |
+| `plugin/crit/skills/` | `[Layer B:copilot]` | GitHub Copilot CLI skills. Discovered via the `"skills"` field in `plugin/crit/.claude-plugin/plugin.json`. |
 
-| Path | Purpose |
-|------|---------|
-| `plugin/crit/.claude-plugin/plugin.json` | Plugin manifest consumed by Claude Code after install. Includes `"skills": "skills/"` to expose Copilot CLI skills. |
-| `plugin/crit/commands/` | Slash commands available after plugin install (`/crit:review`, etc.). |
-| `plugin/crit/skills/` | GitHub Copilot CLI skills. Discovered by Copilot CLI via the `"skills"` field in `plugin.json`. |
+### Layer C — Embedded binary → CLI-installed assets
 
-### Layer C — Standalone Claude / Copilot skill install (`internal/cli/skill/`)
+`crit setup-*` commands read these files from the **embedded filesystem** inside the binary
+and copy them to the user's machine.  The same skill files serve both Claude Code and Copilot CLI.
 
-`crit setup-claude` and `crit setup-copilot` read these files from the embedded
-filesystem inside the binary and write them to:
+| Path | Label | Installed to (global / --project) |
+|------|-------|------------------------------------|
+| `internal/cli/skill/*/SKILL.md` | `[Layer C:claude-code]` | `~/.claude/skills/` / `.claude/skills/` |
+| `internal/cli/skill/*/SKILL.md` | `[Layer C:copilot]` | `~/.copilot/skills/` / `.copilot/skills/` |
+| `internal/cli/opencode/*.md` | `[Layer C:opencode]` | `~/.config/opencode/commands/` / `.opencode/commands/` |
 
-- `~/.claude/skills/` (global) or `.claude/skills/` (`--project`) for **Claude Code**
-- `~/.copilot/skills/` (global) or `.copilot/skills/` (`--project`) for **GitHub Copilot CLI**
+Source resolution for all three commands (priority order):
+1. `--source <dir>` flag
+2. `$CRIT_SKILLS_DIR` / `$CRIT_OPENCODE_DIR` environment variable
+3. Embedded files bundled in the binary (default)
 
-This layer is for users who do **not** use the plugin marketplace but want the skills
-available as standalone `/crit-review`, `/crit-code-review`, `/crit-plan-review` commands.
+### Layer D — Project-local developer tools (git-ignored)
 
-### Layer D — opencode command install (`internal/cli/opencode/`)
+| Path | Label | Created by |
+|------|-------|-----------|
+| `.opencode/commands/` | `[Layer D:opencode]` | `task init-opencode` (runs `crit setup-opencode --project --force`) |
 
-`crit setup-opencode` reads these flat `.md` files (embedded in the binary) and copies
-them to:
-
-- `~/.config/opencode/commands/` (global) or `.opencode/commands/` (`--project`)
-
-opencode commands are flat files with YAML frontmatter (`description`, `agent`, `model`).
-They do not support `allowed-tools` or `argument-hint`.
-
-### Layer E — Developer environment (`.opencode/commands/`)
-
-When a **contributor to crit** runs opencode inside this repository, these commands
-are available.  Mirrors the role of root `commands/` but for opencode instead of
-Claude Code.
+These files are **not committed**.  They are for contributors who use opencode
+to work on crit itself.  Run `task init-claude`, `task init-copilot`, or
+`task init-opencode` to populate the corresponding local config.
 
 ## Why `commands/` and `plugin/crit/commands/` Have the Same Content
 
 They are intentionally identical in content but exist for different reasons:
 
-| File set | Used when |
-|----------|-----------|
-| `commands/*.md` | Repo is added as a plugin directly (Layer A path) |
-| `plugin/crit/commands/*.md` | Plugin is installed via marketplace (Layer B path) |
-
-The Claude Code plugin system resolves slash commands from wherever the plugin was
-installed.  Keeping both sets ensures the commands work regardless of how the user
-installed crit.
+| File set | Label | Used when |
+|----------|-------|-----------|
+| `commands/*.md` | `[Layer A:claude-code]` | Repo added as a direct plugin |
+| `plugin/crit/commands/*.md` | `[Layer B:claude-code]` | Plugin installed via marketplace |
 
 ## Why `internal/cli/skill/` and `plugin/crit/skills/` Both Have SKILL.md Files
 
-| File set | Format | Used by |
-|----------|--------|---------|
-| `internal/cli/skill/*/SKILL.md` | Embedded → installed by `crit setup-claude` / `setup-copilot` | Users who run the CLI setup commands |
-| `plugin/crit/skills/*/SKILL.md` | Checked into `plugin/` tree, copied at plugin install | GitHub Copilot CLI users who install via the plugin marketplace |
-
-The content is equivalent, but the delivery mechanism is different.
+| File set | Label | Delivery mechanism |
+|----------|-------|--------------------|
+| `internal/cli/skill/*/SKILL.md` | `[Layer C:claude-code]` / `[Layer C:copilot]` | Embedded in binary; installed by `crit setup-claude` / `setup-copilot` |
+| `plugin/crit/skills/*/SKILL.md` | `[Layer B:copilot]` | Committed in `plugin/` tree; copied at plugin install |
 
 ## Files That Are **Not** Tracked (`.gitignore`)
 
 | Path | Reason |
 |------|--------|
 | `/crit` | Root-level built binary from `go build` |
-| `dist/` | GoReleaser output directory with cross-platform binaries |
-| `.task/` | Taskfile internal checksum cache (build freshness tracking) |
-| `.claude/` | Local Claude Code session state (not part of the plugin) |
+| `dist/` | GoReleaser output with cross-platform binaries |
+| `.task/` | Taskfile internal checksum cache |
+| `.claude/` | Local Claude Code session state |
+| `.opencode/` | `[Layer D:opencode]` project-local opencode commands; created by `task init-opencode` |
