@@ -20,7 +20,9 @@ var rootCmd = &cobra.Command{
 	},
 }
 
-func Execute() int {
+// Execute wires the injected version into the root command and runs it.
+func Execute(version string) int {
+	rootCmd.Version = version
 	if err := rootCmd.Execute(); err != nil {
 		return 3
 	}
