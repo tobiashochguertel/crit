@@ -281,14 +281,33 @@ tasks:
 
 ## Trade-offs
 
-| Benefit | Cost |
-|---------|------|
-| Skills/commands update without a CLI release | Requires internet access at runtime (when `crit setup-*` runs; offline: use local path in config) |
-| No binary bloat from embedded markdown | Must handle network errors gracefully |
-| Symlink eliminates Copilot duplicate | Symlinks need care in `.gitattributes` |
-| Fewer root-level directories — code moves to `packages/` | Directory nesting increases inside `packages/` |
-| Optional `init-*` tasks for local AI agent configuration | Developers who want project-local setup need one extra task |
-| Offline use via local path in config | Extra step to configure config file |
+### Benefits
+
+| Area | Benefit |
+|------|---------|
+| **Maintainability** | Clear ownership per AI agent — `packages/claude-code/`, `packages/copilot/`, `packages/opencode/`; you always know exactly where to look or change |
+| **Maintainability** | All related changes land in one PR — updating a skill _and_ the CLI behaviour that depends on it never requires coordinating across repos |
+| **Maintainability** | One issue tracker, one CI pipeline, one release workflow — no "which repo do I file this in?" confusion |
+| **Maintainability** | Adding a new AI agent requires one `AgentDef` entry in `agent_config.go` plus one new `packages/<agent>/` directory — no existing code to touch |
+| **Content** | Skills and commands update without a CLI release — edit a `.md` file, commit; next `crit setup-*` run picks it up immediately |
+| **Content** | Zero binary bloat — no embedded Markdown in the compiled binary |
+| **Content** | Symlink in `packages/copilot/` eliminates duplicate SKILL.md files — one canonical source, two agents |
+| **Content** | Non-Go contributors (technical writers, AI prompt engineers) can improve skills with nothing more than a text editor and a PR |
+| **Developer experience** | One `git clone` to get everything — no cross-repo context switching during development |
+| **Developer experience** | Fast iteration: change a SKILL.md → run `crit setup-claude --source ./packages/claude-code/skills/` → instant feedback, no rebuild |
+| **Developer experience** | Developer chooses which AI agent to configure locally — no vendor lock-in; `init-claude`, `init-copilot`, `init-opencode` are all optional convenience tasks |
+| **Developer experience** | Overriding the skills source is first-class: `--source` flag, `CRIT_SKILLS_DIR` env var, or `~/.config/crit/config.yaml` — works for local paths, remote URLs, and pinned git refs |
+| **Developer experience** | Marketplace `marketplace.json` and plugin files are always in sync — no cross-repo PR needed to keep them consistent |
+| **Cleaner root** | Repository root contains only marketplace metadata and top-level files; implementation detail directories (`internal/`, `cmd/`) move to `packages/crit-cli/` |
+
+### Costs / Mitigations
+
+| Cost | Mitigation |
+|------|-----------|
+| Symlinks require `.gitattributes` entry and contributors need to be aware of them | Add `task check-symlinks` (or a pre-commit hook) that validates symlinks are intact and correctly listed in `.gitattributes`; run in CI |
+| Config file needed to override the default source URL | Optional for most users — hardcoded defaults work out-of-the-box; config only needed for pinning to a version or pointing at a fork |
+| Migration effort to reorganise current files into `packages/` layout | One-time, mechanical move; see [Migration Steps](#migration-steps) |
+| `crit setup-*` requires network access by default | AI-agent tooling requires internet access as a baseline; offline users set `--source` to a local directory — this is a documented first-class feature, not a workaround |
 
 ---
 

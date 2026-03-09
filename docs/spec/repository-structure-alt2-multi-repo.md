@@ -306,17 +306,46 @@ version can override `skills_url` in `~/.config/crit/config.yaml`.
 
 ## Trade-offs vs. Monorepo
 
+### Side-by-side comparison
+
 | Concern | Monorepo (Alt 1) | Multi-repo (Alt 2) |
 |---------|-----------------|-------------------|
-| **Setup complexity** | One repo, one clone | Four repos, cross-repo coordination |
-| **Skills duplication** | Solved by symlink | Solved by separate canonical repos |
+| **Repository count** | 1 | 4 (or 2 with minimal variant) |
+| **Developer setup** | One `git clone` | Multiple clones; cross-repo coordination |
+| **Contributor onboarding** | Single entry point | Must find the right repo |
+| **All related changes in one PR** | ✅ Yes | Cross-repo PRs needed for coupled changes |
 | **Plugin updates without CLI release** | ✅ Yes (runtime download) | ✅ Yes (runtime download) |
+| **Skills duplication** | Solved by symlink inside monorepo | Solved by separate canonical repos |
 | **Claude Code `git-subdir` for plugins** | Points inside the monorepo | Points to dedicated plugin repo |
-| **Contributor onboarding** | Clone one repo | Must find the right repo |
-| **Release process** | Single GoReleaser workflow | Per-repo releases |
-| **Breaking the "marketplace + CLI" coupling** | Partial (still one repo) | ✅ Complete separation |
-| **`[Layer D:opencode]`** | git-ignored; `task init-opencode` | git-ignored; `task init-opencode` |
 | **Binary size** | Small (no embedded markdown) | Small (no embedded markdown) |
+| **CI pipeline count** | 1 | 4 (or 2) — one per repo |
+| **Release process** | Single GoReleaser workflow | Per-repo releases; compatibility matrix needed |
+| **Separating "marketplace + CLI" coupling** | Partial (still one repo) | ✅ Complete separation |
+| **Contributor needs Go knowledge** | Required for any change in `packages/crit-cli/` | ✅ Plugin contributors need no Go knowledge |
+| **Issue tracker** | One tracker for all concerns | Separate trackers — may cause confusion |
+
+### Benefits unique to Multi-repo (Alt 2)
+
+| Benefit |
+|---------|
+| **Complete separation of concerns** — the CLI binary is a pure Go tool with no AI-agent-specific files committed to it |
+| **Plugin repos are independently versioned** — a Claude Code skill improvement can ship as `crit-claude-code v1.1.0` without touching the CLI at all |
+| **Non-Go contributors can own a plugin repo** — technical writers, prompt engineers, and AI practitioners can manage `crit-claude-code` with only Markdown and JSON |
+| **Plugin repos are tiny and easy to understand** — no Go source, no build tooling, no release config; just content files |
+| **CLI repo stays permanently lean** — no `plugin/`, no `.claude-plugin/`, no agent-specific directories ever accumulate |
+| **Faster review cycles** — a PR touching only SKILL.md files in `crit-claude-code` is reviewed by plugin maintainers, not Go engineers |
+| **Independent release cadence** — plugin repos can ship bug fixes and new skills daily; the CLI binary releases on a slower, more deliberate schedule |
+| **Clear blast radius** — a broken skill affects only that plugin repo; the CLI is unaffected and remains installable |
+
+### Costs unique to Multi-repo (Alt 2)
+
+| Cost | Mitigation |
+|------|-----------|
+| **Cross-repo coordination for breaking changes** — e.g., a new skill format requires a CLI update _and_ a plugin update | Document a compatibility matrix in `crit` README; users can pin plugin version via `config.yaml` |
+| **Multiple clones for full development** — working on CLI + plugin simultaneously requires two terminals | Most changes touch only one repo; cross-repo work is the exception |
+| **Compatibility matrix must be maintained** | Add a table to `crit` README mapping CLI version → supported plugin versions; automate with a CI check |
+| **More GitHub notifications and release tags to track** | Use GitHub's "Watch" settings per repo to filter noise |
+| **Finding the right repo** for a bug/feature is less obvious | Strong README cross-links between all repos; one-liner install docs in each |
 
 ---
 
