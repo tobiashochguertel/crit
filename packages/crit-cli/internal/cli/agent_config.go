@@ -66,7 +66,7 @@ var agents = map[string]AgentDef{
 }
 
 // defaultSkills is the hardcoded fallback used when manifest.yaml cannot be fetched.
-// Keep this list in sync with plugin/crit/skills/manifest.yaml.
+// Keep this list in sync with packages/claude-code/skills/manifest.yaml.
 var defaultSkills = []SkillSpec{
 	{Dir: "crit-review", Name: "crit-review"},
 	{Dir: "crit-plan-review", Name: "crit-plan-review"},
@@ -74,7 +74,7 @@ var defaultSkills = []SkillSpec{
 }
 
 // defaultCommands is the hardcoded fallback used when manifest.yaml cannot be fetched.
-// Keep this list in sync with plugin/crit/opencode/manifest.yaml.
+// Keep this list in sync with packages/opencode/commands/manifest.yaml.
 var defaultCommands = []CommandSpec{
 	{File: "crit-review", Name: "crit-review"},
 	{File: "crit-code-review", Name: "crit-code-review"},

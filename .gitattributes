@@ -1,0 +1,2 @@
+# Symlinks — git tracks these natively; list here for cross-platform awareness
+packages/copilot/skills symlink

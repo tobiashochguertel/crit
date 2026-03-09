@@ -1,9 +1,10 @@
 version: "3"
 
+# Root Taskfile — delegates build/test/lint tasks to packages/crit-cli/
+# and provides repo-level utilities (symlink checks, package init tasks).
+
 vars:
-  BINARY: crit
-  CMD_PKG: ./cmd/crit
-  BUILD_DIR: dist
+  CLI_DIR: packages/crit-cli
 
 tasks:
   default:
@@ -11,85 +12,103 @@ tasks:
     cmds:
       - task --list
 
+  # ── Build / test / lint / format ─────────────────────────────────────────
+
   build:
-    desc: Build the crit binary
-    cmds:
-      - mkdir -p {{.BUILD_DIR}}
-      - go build -o {{.BUILD_DIR}}/{{.BINARY}} {{.CMD_PKG}}
-    sources:
-      - "**/*.go"
-      - go.mod
-      - go.sum
-    generates:
-      - "{{.BUILD_DIR}}/{{.BINARY}}"
+    desc: Build the crit binary (delegates to packages/crit-cli)
+    dir: "{{.CLI_DIR}}"
+    cmds: [task build]
 
   install:
     desc: Install the crit binary to GOPATH/bin
-    cmds:
-      - go install {{.CMD_PKG}}
+    dir: "{{.CLI_DIR}}"
+    cmds: [task install]
 
   test:
     desc: Run all tests
-    cmds:
-      - go test ./...
+    dir: "{{.CLI_DIR}}"
+    cmds: [task test]
 
   test-verbose:
     desc: Run all tests with verbose output
-    cmds:
-      - go test -v ./...
+    dir: "{{.CLI_DIR}}"
+    cmds: [task test-verbose]
 
   test-race:
     desc: Run tests with race detector
-    cmds:
-      - go test -race ./...
+    dir: "{{.CLI_DIR}}"
+    cmds: [task test-race]
 
   lint:
     desc: Run go vet (static analysis)
-    cmds:
-      - go vet ./...
+    dir: "{{.CLI_DIR}}"
+    cmds: [task lint]
 
   format:
     desc: Format Go source code with gofmt
-    cmds:
-      - gofmt -w .
+    dir: "{{.CLI_DIR}}"
+    cmds: [task format]
 
   format-check:
     desc: Check Go source code formatting (no changes)
-    cmds:
-      - gofmt -l . | tee /dev/stderr | wc -l | grep -q '^0$'
+    dir: "{{.CLI_DIR}}"
+    cmds: [task format-check]
 
   tidy:
     desc: Tidy go.mod and go.sum
-    cmds:
-      - go mod tidy
+    dir: "{{.CLI_DIR}}"
+    cmds: [task tidy]
 
   clean:
     desc: Remove build artifacts
-    cmds:
-      - rm -rf {{.BUILD_DIR}}
-
-  init-claude:
-    desc: Install Claude Code skills for this project (requires a build first)
-    deps: [build]
-    cmds:
-      - ./{{.BUILD_DIR}}/{{.BINARY}} setup-claude --project --force
-
-  init-copilot:
-    desc: Install GitHub Copilot CLI skills for this project (requires a build first)
-    deps: [build]
-    cmds:
-      - ./{{.BUILD_DIR}}/{{.BINARY}} setup-copilot --project --force
-
-  init-opencode:
-    desc: Install opencode commands for this project (requires a build first)
-    deps: [build]
-    cmds:
-      - ./{{.BUILD_DIR}}/{{.BINARY}} setup-opencode --project --force
+    dir: "{{.CLI_DIR}}"
+    cmds: [task clean]
 
   all:
-    desc: Format, lint, test, and build
+    desc: "Format, lint, test, and build (full CI pipeline)"
+    dir: "{{.CLI_DIR}}"
+    cmds: [task all]
+
+  # ── Optional project-local AI agent setup ────────────────────────────────
+  # These tasks install skills/commands into the CURRENT project directory.
+  # They are optional convenience helpers — the repository works without them.
+  # Choose the AI agent(s) you develop with.
+
+  init-claude:
+    desc: "[optional] Install Claude Code skills for this project"
+    dir: "{{.CLI_DIR}}"
+    cmds: [task init-claude]
+
+  init-copilot:
+    desc: "[optional] Install GitHub Copilot CLI skills for this project"
+    dir: "{{.CLI_DIR}}"
+    cmds: [task init-copilot]
+
+  init-opencode:
+    desc: "[optional] Install opencode commands for this project"
+    dir: "{{.CLI_DIR}}"
+    cmds: [task init-opencode]
+
+  # ── Repository maintenance ────────────────────────────────────────────────
+
+  check-symlinks:
+    desc: Verify all declared symlinks in packages/ are intact
     cmds:
-      - task: format
-      - task: lint
-      - task: test
-      - task: build
+      - |
+        FAILED=0
+        for link in packages/copilot/skills; do
+          if [ ! -L "$link" ]; then
+            echo "ERROR: expected symlink missing: $link"
+            FAILED=1
+          elif [ ! -e "$link" ]; then
+            echo "ERROR: symlink broken (target missing): $link -> $(readlink $link)"
+            FAILED=1
+          else
+            echo "OK: $link -> $(readlink $link)"
+          fi
+        done
+        if [ $FAILED -ne 0 ]; then
+          echo ""
+          echo "Fix: cd packages/copilot && ln -s ../claude-code/skills skills"
+          exit 1
+        fi

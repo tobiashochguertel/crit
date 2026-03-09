@@ -14,11 +14,11 @@ import (
 // DefaultSkillsURL is the base raw-content URL for the canonical skill files
 // (SKILL.md files used by Claude Code and Copilot CLI).
 // Individual files are fetched by appending "/<skill-dir>/SKILL.md".
-const DefaultSkillsURL = "https://raw.githubusercontent.com/tobiashochguertel/crit/feature/multi-agent-plugin-support/plugin/crit/skills"
+const DefaultSkillsURL = "https://raw.githubusercontent.com/tobiashochguertel/crit/feature/multi-agent-plugin-support/packages/claude-code/skills"
 
 // DefaultCommandsURL is the base raw-content URL for the canonical opencode
 // command files.  Individual files are fetched by appending "/<cmd>.md".
-const DefaultCommandsURL = "https://raw.githubusercontent.com/tobiashochguertel/crit/feature/multi-agent-plugin-support/plugin/crit/opencode"
+const DefaultCommandsURL = "https://raw.githubusercontent.com/tobiashochguertel/crit/feature/multi-agent-plugin-support/packages/opencode/commands"
 
 // Config holds crit's persistent configuration, stored in
 // ~/.config/crit/config.yaml (XDG) or ~/.crit.yaml (fallback).

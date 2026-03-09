@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "crit",
-      "source": "./plugin/crit",
+      "source": "./packages/claude-code",
       "description": "Review markdown documents with an interactive TUI and let Claude address feedback automatically."
     }
   ]

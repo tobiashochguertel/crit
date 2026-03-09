@@ -1,12 +1,20 @@
-# Built binaries
+# Built binaries (root-level, legacy)
 /crit
 /dist/
 
+# Build output inside packages/crit-cli/
+packages/crit-cli/dist/
+packages/crit-cli/crit
+
 # Taskfile internal checksums
 .task/
+packages/crit-cli/.task/
 
-# Local Claude Code config
+# Local Claude Code config (created by: task init-claude)
 .claude/
 
 # Local opencode config (created by: task init-opencode)
 .opencode/
+
+# Local copilot config
+.github/copilot/

@@ -1,0 +1,95 @@
+version: "3"
+
+vars:
+  BINARY: crit
+  CMD_PKG: ./cmd/crit
+  BUILD_DIR: dist
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+
+  build:
+    desc: Build the crit binary
+    cmds:
+      - mkdir -p {{.BUILD_DIR}}
+      - go build -o {{.BUILD_DIR}}/{{.BINARY}} {{.CMD_PKG}}
+    sources:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+    generates:
+      - "{{.BUILD_DIR}}/{{.BINARY}}"
+
+  install:
+    desc: Install the crit binary to GOPATH/bin
+    cmds:
+      - go install {{.CMD_PKG}}
+
+  test:
+    desc: Run all tests
+    cmds:
+      - go test ./...
+
+  test-verbose:
+    desc: Run all tests with verbose output
+    cmds:
+      - go test -v ./...
+
+  test-race:
+    desc: Run tests with race detector
+    cmds:
+      - go test -race ./...
+
+  lint:
+    desc: Run go vet (static analysis)
+    cmds:
+      - go vet ./...
+
+  format:
+    desc: Format Go source code with gofmt
+    cmds:
+      - gofmt -w .
+
+  format-check:
+    desc: Check Go source code formatting (no changes)
+    cmds:
+      - gofmt -l . | tee /dev/stderr | wc -l | grep -q '^0$'
+
+  tidy:
+    desc: Tidy go.mod and go.sum
+    cmds:
+      - go mod tidy
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -rf {{.BUILD_DIR}}
+
+  init-claude:
+    desc: Install Claude Code skills for this project (requires a build first)
+    deps: [build]
+    cmds:
+      - ./{{.BUILD_DIR}}/{{.BINARY}} setup-claude --project --force
+
+  init-copilot:
+    desc: Install GitHub Copilot CLI skills for this project (requires a build first)
+    deps: [build]
+    cmds:
+      - ./{{.BUILD_DIR}}/{{.BINARY}} setup-copilot --project --force
+
+  init-opencode:
+    desc: Install opencode commands for this project (requires a build first)
+    deps: [build]
+    cmds:
+      - ./{{.BUILD_DIR}}/{{.BINARY}} setup-opencode --project --force
+
+  all:
+    desc: Format, lint, test, and build
+    cmds:
+      - task: format
+      - task: lint
+      - task: test
+      - task: build

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/crit_logo.png" alt="crit" width="300">
+  <img src="docs/assets/crit_logo.png" alt="crit" width="300">
 </p>
 
 # Crit
@@ -8,7 +8,7 @@ A terminal-based review tool for documents and code. Read a plan or review code 
 
 Built for the human-in-the-loop workflow: Claude writes code or a plan, you review it in a TUI, Claude reads your comments and makes changes.
 
-![crit code review demo](demo/code-review.gif)
+![crit code review demo](docs/demo/code-review.gif)
 
 ## Install
 
