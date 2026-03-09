@@ -1,0 +1,12 @@
+# manifest.yaml — skills available from this source
+# crit fetches this file at runtime to discover what skills to install.
+# Adding a new skill here takes effect for all users immediately,
+# without requiring a new crit binary release.
+version: 1
+skills:
+  - dir: crit-review
+    name: crit-review
+  - dir: crit-plan-review
+    name: crit-plan-review
+  - dir: crit-code-review
+    name: crit-code-review

@@ -1,0 +1,12 @@
+# manifest.yaml — opencode commands available from this source
+# crit fetches this file at runtime to discover what commands to install.
+# Adding a new command here takes effect for all users immediately,
+# without requiring a new crit binary release.
+version: 1
+commands:
+  - file: crit-review
+    name: crit-review
+  - file: crit-code-review
+    name: crit-code-review
+  - file: crit-plan-review
+    name: crit-plan-review

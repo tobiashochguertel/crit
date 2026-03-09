@@ -25,7 +25,7 @@ the explanation of the layer label scheme.
 | Marketplace uses `git-subdir` | `marketplace.json` references each package as a subdirectory — no full-repo clone needed |
 | Flat root | Only marketplace files and top-level metadata live at the root |
 | Docs and demos co-located | `docs/` contains all documentation, specs, demos, and assets |
-| No release required for skill/command changes | CLI fetches latest content from configurable source at setup time |
+| No release required for skill/command changes | CLI fetches latest content from configurable source at runtime (when `crit setup-*` runs) |
 
 ---
 
@@ -49,8 +49,8 @@ the explanation of the layer label scheme.
 │   │   ├── .goreleaser.yaml               #   Cross-platform release config
 │   │   ├── .mise.toml                     #   Pins Go version (e.g. 1.24.2)
 │   │   ├── CHANGELOG.md                   #   Version history (moved from root)
-│   │   ├── Taskfile.yml                   #   build, test, lint, format, tidy, clean
-│   │   │                                  #   all, init-claude, init-copilot, init-opencode
+│   │   ├── Taskfile.yml                   #   build, test, lint, format, tidy, clean, all
+│   │   │                                  #   init-claude, init-copilot, init-opencode  (optional)
 │   │   ├── go.mod                         #   module github.com/kevindutra/crit (path unchanged)
 │   │   ├── go.sum
 │   │   │
@@ -64,11 +64,10 @@ the explanation of the layer label scheme.
 │   │       │   ├── review.go
 │   │       │   ├── review_test.go
 │   │       │   ├── root.go
-│   │       │   ├── setup.go               #   Shared installer helpers (FetchFile, resolveTargetDir)
-│   │       │   ├── setup_claude.go        #   [Layer C:claude-code] Downloads skills at setup time
-│   │       │   ├── setup_copilot.go       #   [Layer C:copilot]     Downloads skills at setup time
-│   │       │   ├── setup_opencode.go      #   [Layer C:opencode]    Downloads commands at setup time
-│   │       │   ├── source.go              #   Config, LoadConfig, ResolveSource, FetchFile
+│   │       │   ├── setup.go               #   Shared installer helpers; makeSetupCmd factory
+│   │       │   ├── agent_config.go        #   [Layer C] AgentDef registry; add new agents here
+│   │       │   ├── setup_agents.go        #   [Layer C] init() registers all setup-* commands
+│   │       │   ├── source.go              #   Config, LoadConfig, ResolveSource, FetchFile, FetchManifest
 │   │       │   └── status.go
 │   │       ├── document/
 │   │       ├── git/
@@ -83,6 +82,7 @@ the explanation of the layer label scheme.
 │   │   │   ├── code-review.md
 │   │   │   └── plan-review.md
 │   │   └── skills/                        #   ★ CANONICAL source for SKILL.md files
+│   │       ├── manifest.yaml              #     Runtime-discoverable file list (fetched by `crit setup-claude/copilot`)
 │   │       ├── crit-review/               #     Downloaded by `crit setup-claude` and `crit setup-copilot`
 │   │       │   └── SKILL.md
 │   │       ├── crit-code-review/
@@ -95,6 +95,7 @@ the explanation of the layer label scheme.
 │   │
 │   └── opencode/                          # [Layer B:opencode] opencode commands package
 │       └── commands/                      #   ★ CANONICAL source for opencode commands
+│           ├── manifest.yaml              #     Runtime-discoverable file list (fetched by `crit setup-opencode`)
 │           ├── crit-review.md             #     Downloaded by `crit setup-opencode`
 │           ├── crit-code-review.md
 │           └── crit-plan-review.md
@@ -126,6 +127,9 @@ the explanation of the layer label scheme.
 > Run `task init-opencode` (from the repo root or from `packages/crit-cli/`) to create
 > `.opencode/commands/` locally — labelled **[Layer D:opencode]** — for contributors who
 > use opencode.  The same applies for `init-claude` and `init-copilot`.
+> These `init-*` tasks are **optional** convenience shortcuts; the repository
+> works without them.  Use them only when you want local project-level
+> configuration for the AI agent you develop with.
 
 ---
 
@@ -225,8 +229,10 @@ init-opencode:
   cmds: [./dist/crit setup-opencode --project --force]
 ```
 
-> Because skills/commands are downloaded at runtime, `init-*` tasks do **not** need a
-> `sync` step before building — there is nothing to sync into the binary.
+> Because skills/commands are downloaded at runtime (when `crit setup-*` runs),
+> `init-*` tasks do **not** need a `sync` step before building — there is nothing to
+> sync into the binary.  Running an `init-*` task simply invokes the freshly-built
+> binary to install files into the current project tree.
 
 ### 5. Root `Taskfile.yml` delegates to CLI package
 
@@ -277,11 +283,11 @@ tasks:
 
 | Benefit | Cost |
 |---------|------|
-| Skills/commands update without a CLI release | Requires internet access at setup time |
+| Skills/commands update without a CLI release | Requires internet access at runtime (when `crit setup-*` runs; offline: use local path in config) |
 | No binary bloat from embedded markdown | Must handle network errors gracefully |
 | Symlink eliminates Copilot duplicate | Symlinks need care in `.gitattributes` |
-| Clear per-agent ownership | More directories at top level |
-| `init-*` tasks for local AI agent config | Developers must run `task init-opencode` etc. |
+| Fewer root-level directories — code moves to `packages/` | Directory nesting increases inside `packages/` |
+| Optional `init-*` tasks for local AI agent configuration | Developers who want project-local setup need one extra task |
 | Offline use via local path in config | Extra step to configure config file |
 
 ---
@@ -291,7 +297,7 @@ tasks:
 | Concern | Current | Monorepo alternative |
 |---------|---------|---------------------|
 | Skills source of truth | Two copies (`internal/cli/skill/` + `plugin/crit/skills/`) | One copy in `packages/claude-code/skills/` |
-| Binary embedding | `//go:embed` in `setup_claude.go`, `setup_opencode.go` | **Removed** — download at runtime |
+| Binary embedding | `//go:embed` in `setup_claude.go`, `setup_opencode.go` | **Removed** — download at runtime via `agent_config.go` + `FetchManifest` |
 | AI agent directories | Mixed under `plugin/` and `internal/cli/` | Dedicated `packages/<agent>/` |
 | CLI source location | Repository root | `packages/crit-cli/` |
 | Demo/asset location | `demo/` and `assets/` at root | `docs/demo/` and `docs/assets/` |

@@ -64,6 +64,44 @@ func LoadConfig() Config {
 	return Config{}
 }
 
+// Manifest describes the files available at a given source location.
+// It is fetched from manifest.yaml at the source base URL or local path,
+// allowing new skills/commands to be discovered at runtime without a CLI release.
+type Manifest struct {
+	Version  int           `yaml:"version"`
+	Skills   []SkillSpec   `yaml:"skills,omitempty"`
+	Commands []CommandSpec `yaml:"commands,omitempty"`
+}
+
+// SkillSpec identifies a single SKILL.md-based skill subdirectory.
+type SkillSpec struct {
+	Dir  string `yaml:"dir"`  // subdirectory name (and skill name)
+	Name string `yaml:"name"` // display name
+}
+
+// CommandSpec identifies a single flat .md command file.
+type CommandSpec struct {
+	File string `yaml:"file"` // filename without .md extension
+	Name string `yaml:"name"` // display name
+}
+
+// FetchManifest attempts to load manifest.yaml from source.
+// Returns defaultManifest unchanged if the file is absent, unreachable, or malformed.
+func FetchManifest(source string, defaultManifest Manifest) Manifest {
+	data, err := FetchFile(source, "manifest.yaml")
+	if err != nil {
+		return defaultManifest
+	}
+	var m Manifest
+	if err := yaml.Unmarshal(data, &m); err != nil {
+		return defaultManifest
+	}
+	if len(m.Skills)+len(m.Commands) == 0 {
+		return defaultManifest
+	}
+	return m
+}
+
 // ResolveSource returns the effective source (local path or URL) for an asset
 // type.  The first non-empty value in priority order wins:
 //
