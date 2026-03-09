@@ -1,5 +1,9 @@
-# Built binary
+# Built binaries
 /crit
+/dist/
+
+# Taskfile internal checksums
+.task/
 
 # Local Claude Code config
 .claude/
