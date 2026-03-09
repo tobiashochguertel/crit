@@ -1,14 +1,10 @@
 package cli
 
 import (
-	"embed"
 	"fmt"
 
 	"github.com/spf13/cobra"
 )
-
-//go:embed skill/crit-review/SKILL.md skill/crit-plan-review/SKILL.md skill/crit-code-review/SKILL.md
-var skillContent embed.FS
 
 // skillsToInstall is shared with setup_copilot.go (same package, same SKILL.md format).
 var skillsToInstall = []struct {
@@ -32,22 +28,23 @@ var setupClaudeCmd = &cobra.Command{
 Default target:  ~/.claude/skills/
 With --project:  .claude/skills/ (current directory)
 
-Source priority:
-  1. --source <dir>     local directory containing skill subdirectories
-  2. $CRIT_SKILLS_DIR   same, via environment variable
-  3. (embedded)         files bundled inside the binary (default)`,
+Source priority (first non-empty wins):
+  1. --source <path|url>  local directory or HTTP(S) URL base
+  2. $CRIT_SKILLS_DIR     same, via environment variable
+  3. skills_url in config  ~/.config/crit/config.yaml
+  4. (default URL)         ` + DefaultSkillsURL,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg := LoadConfig()
+		source := ResolveSource(claudeSource, "CRIT_SKILLS_DIR", cfg.SkillsURL, DefaultSkillsURL)
+
 		destDir, scope, err := resolveTargetDir(claudeProject, ".claude/skills", ".claude/skills")
 		if err != nil {
 			return err
 		}
-		src, prefix, err := openSourceFS(claudeSource, "CRIT_SKILLS_DIR", skillContent, "skill")
-		if err != nil {
-			return err
-		}
 		fmt.Printf("Installing Claude Code skills %s  →  %s\n", scope, destDir)
-		if err := installSkills(src, prefix, destDir, skillsToInstall, claudeForce); err != nil {
+		fmt.Printf("Source: %s\n", source)
+		if err := installSkills(source, destDir, skillsToInstall, claudeForce); err != nil {
 			return err
 		}
 		fmt.Println("\nAvailable skills:")
@@ -62,5 +59,5 @@ func init() {
 	rootCmd.AddCommand(setupClaudeCmd)
 	setupClaudeCmd.Flags().BoolVar(&claudeProject, "project", false, "install to .claude/skills/ in current directory instead of globally")
 	setupClaudeCmd.Flags().BoolVar(&claudeForce, "force", false, "overwrite existing skill files")
-	setupClaudeCmd.Flags().StringVar(&claudeSource, "source", "", "local directory with skill subdirs (overrides embedded; also honours $CRIT_SKILLS_DIR)")
+	setupClaudeCmd.Flags().StringVar(&claudeSource, "source", "", "local directory or HTTP(S) URL base for skill files")
 }

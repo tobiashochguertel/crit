@@ -1,6 +1,6 @@
 ---
 title: "Alternative Repository Structure — Monorepo"
-description: "A proposed refactoring of the crit repository to a clean monorepo where each AI agent integration lives in its own package, eliminating duplication between embedded binary files and plugin distribution files."
+description: "A proposed refactoring of the crit repository to a clean monorepo where each AI agent integration lives in its own package, with skills and commands downloaded at runtime rather than embedded in the binary."
 last_updated: "2025-03-09"
 ---
 
@@ -20,11 +20,12 @@ the explanation of the layer label scheme.
 
 | Goal | How the monorepo achieves it |
 |------|------------------------------|
-| Eliminate `[Layer C]` duplication | One canonical skills/commands source per agent; binary embeds from generated copies only |
+| Eliminate `[Layer C]` duplication | One canonical skills/commands source per agent; CLI downloads at runtime — no binary embedding |
 | Clear ownership per AI agent | `packages/claude-code/`, `packages/copilot/`, `packages/opencode/` |
 | Marketplace uses `git-subdir` | `marketplace.json` references each package as a subdirectory — no full-repo clone needed |
 | Flat root | Only marketplace files and top-level metadata live at the root |
 | Docs and demos co-located | `docs/` contains all documentation, specs, demos, and assets |
+| No release required for skill/command changes | CLI fetches latest content from configurable source at setup time |
 
 ---
 
@@ -49,7 +50,7 @@ the explanation of the layer label scheme.
 │   │   ├── .mise.toml                     #   Pins Go version (e.g. 1.24.2)
 │   │   ├── CHANGELOG.md                   #   Version history (moved from root)
 │   │   ├── Taskfile.yml                   #   build, test, lint, format, tidy, clean
-│   │   │                                  #   sync, all, init-claude, init-copilot, init-opencode
+│   │   │                                  #   all, init-claude, init-copilot, init-opencode
 │   │   ├── go.mod                         #   module github.com/kevindutra/crit (path unchanged)
 │   │   ├── go.sum
 │   │   │
@@ -59,24 +60,15 @@ the explanation of the layer label scheme.
 │   │   │
 │   │   └── internal/
 │   │       ├── cli/
-│   │       │   ├── embed/                 #   BUILD-TIME GENERATED — git-ignored
-│   │       │   │   ├── claude-code/       #     Copied from packages/claude-code/skills/
-│   │       │   │   │   ├── crit-review/SKILL.md
-│   │       │   │   │   ├── crit-code-review/SKILL.md
-│   │       │   │   │   └── crit-plan-review/SKILL.md
-│   │       │   │   └── opencode/          #     Copied from packages/opencode/commands/
-│   │       │   │       ├── crit-review.md
-│   │       │   │       ├── crit-code-review.md
-│   │       │   │       └── crit-plan-review.md
-│   │       │   │
 │   │       │   ├── comment.go
 │   │       │   ├── review.go
 │   │       │   ├── review_test.go
 │   │       │   ├── root.go
-│   │       │   ├── setup.go               #   Shared installer helpers
-│   │       │   ├── setup_claude.go        #   [Layer C:claude-code] Embeds from ./embed/claude-code/
-│   │       │   ├── setup_copilot.go       #   [Layer C:copilot]     Embeds from ./embed/claude-code/
-│   │       │   ├── setup_opencode.go      #   [Layer C:opencode]    Embeds from ./embed/opencode/
+│   │       │   ├── setup.go               #   Shared installer helpers (FetchFile, resolveTargetDir)
+│   │       │   ├── setup_claude.go        #   [Layer C:claude-code] Downloads skills at setup time
+│   │       │   ├── setup_copilot.go       #   [Layer C:copilot]     Downloads skills at setup time
+│   │       │   ├── setup_opencode.go      #   [Layer C:opencode]    Downloads commands at setup time
+│   │       │   ├── source.go              #   Config, LoadConfig, ResolveSource, FetchFile
 │   │       │   └── status.go
 │   │       ├── document/
 │   │       ├── git/
@@ -90,9 +82,9 @@ the explanation of the layer label scheme.
 │   │   │   ├── review.md
 │   │   │   ├── code-review.md
 │   │   │   └── plan-review.md
-│   │   └── skills/                        #   ★ SINGLE SOURCE OF TRUTH for SKILL.md files
-│   │       ├── crit-review/
-│   │       │   └── SKILL.md               #   Used by both Claude Code and Copilot CLI
+│   │   └── skills/                        #   ★ CANONICAL source for SKILL.md files
+│   │       ├── crit-review/               #     Downloaded by `crit setup-claude` and `crit setup-copilot`
+│   │       │   └── SKILL.md
 │   │       ├── crit-code-review/
 │   │       │   └── SKILL.md
 │   │       └── crit-plan-review/
@@ -101,9 +93,9 @@ the explanation of the layer label scheme.
 │   ├── copilot/                           # [Layer B:copilot] Copilot CLI plugin package
 │   │   └── skills -> ../claude-code/skills #   ★ Symlink — skills are format-compatible
 │   │
-│   └── opencode/                          # [Layer C:opencode] opencode commands package
-│       └── commands/                      #   ★ SINGLE SOURCE OF TRUTH for opencode commands
-│           ├── crit-review.md
+│   └── opencode/                          # [Layer B:opencode] opencode commands package
+│       └── commands/                      #   ★ CANONICAL source for opencode commands
+│           ├── crit-review.md             #     Downloaded by `crit setup-opencode`
 │           ├── crit-code-review.md
 │           └── crit-plan-review.md
 │
@@ -139,40 +131,53 @@ the explanation of the layer label scheme.
 
 ## Key Changes Explained
 
-### 1. Eliminating `[Layer C]` Duplication
+### 1. Runtime download replaces binary embedding
 
-**The problem today:** The same SKILL.md content appears in two places:
+**The problem with embedding:**
 
-| Location | Label | Role |
-|----------|-------|------|
-| `internal/cli/skill/*/SKILL.md` | `[Layer C:claude-code]` / `[Layer C:copilot]` | Embedded in the Go binary |
-| `plugin/crit/skills/*/SKILL.md` | `[Layer B:copilot]` | Distributed as part of the marketplace plugin |
+| Issue | Impact |
+|-------|--------|
+| Skill/command content changes require a new CLI release | Tight coupling between content and binary |
+| Same content exists in `internal/cli/skill/` AND `plugin/crit/skills/` | Manual sync required; files can drift |
+| Binary grows with every skill added | Unnecessary bloat |
 
-If a skill description changes, both copies must be updated manually — they can drift.
+**The monorepo solution:** `packages/claude-code/skills/` and
+`packages/opencode/commands/` are the **canonical sources**.  When a user runs
+`crit setup-claude`, the CLI downloads the files at that moment from a configurable
+source URL — no embedding required.
 
-**The monorepo fix:** `packages/claude-code/skills/` becomes the **single source of truth**.
-The Go binary no longer has its own copy committed.  A Taskfile `sync` step copies files
-into `packages/crit-cli/internal/cli/embed/` (git-ignored) before every build.
+**Source resolution order (first non-empty wins):**
+
+```
+--source <path|url>        CLI flag (local dir or HTTP(S) URL base)
+$CRIT_SKILLS_DIR           Environment variable (for skills)
+$CRIT_OPENCODE_DIR         Environment variable (for opencode commands)
+skills_url: in config      ~/.config/crit/config.yaml
+commands_url: in config    ~/.config/crit/config.yaml
+(default URL)              https://raw.githubusercontent.com/tobiashochguertel/crit/main/packages/claude-code/skills
+```
+
+**Config file** (`~/.config/crit/config.yaml`):
 
 ```yaml
-# In packages/crit-cli/Taskfile.yml
-sync:
-  desc: "Sync plugin files into embed/ for binary embedding"
-  cmds:
-    - rm -rf internal/cli/embed
-    - mkdir -p internal/cli/embed/claude-code internal/cli/embed/opencode
-    - cp -r ../../packages/claude-code/skills/. internal/cli/embed/claude-code/
-    - cp ../../packages/opencode/commands/*.md internal/cli/embed/opencode/
+# Override default download sources
+skills_url: https://raw.githubusercontent.com/tobiashochguertel/crit/main/packages/claude-code/skills
+commands_url: https://raw.githubusercontent.com/tobiashochguertel/crit/main/packages/opencode/commands
 
-build:
-  deps: [sync]
-  cmds:
-    - go build ./cmd/crit
+# Or point to a local checkout for offline/development use:
+# skills_url: /home/user/crit/packages/claude-code/skills
+# commands_url: /home/user/crit/packages/opencode/commands
 ```
 
-`.gitignore` in `packages/crit-cli/`:
-```
-internal/cli/embed/
+**`source.go` provides the download primitive:**
+
+```go
+// FetchFile reads a file from a local path or a remote URL base.
+// source can be:
+//   - "https://raw.githubusercontent.com/..." (HTTP GET)
+//   - "/path/to/local/dir" (os.ReadFile)
+//   - "~/relative/path" (expanded to $HOME/relative/path)
+func FetchFile(source, relPath string) ([]byte, error)
 ```
 
 ### 2. `packages/copilot/` — Symlinked skills
@@ -184,11 +189,6 @@ no sync step required for Copilot CLI.
 ```bash
 # Create the symlink (once, during repository setup)
 cd packages/copilot && ln -s ../claude-code/skills skills
-```
-
-Add to root `.gitattributes` so git tracks the symlink:
-```
-packages/copilot/skills export-subst
 ```
 
 ### 3. Marketplace `marketplace.json` using `git-subdir`
@@ -225,6 +225,9 @@ init-opencode:
   cmds: [./dist/crit setup-opencode --project --force]
 ```
 
+> Because skills/commands are downloaded at runtime, `init-*` tasks do **not** need a
+> `sync` step before building — there is nothing to sync into the binary.
+
 ### 5. Root `Taskfile.yml` delegates to CLI package
 
 ```yaml
@@ -259,11 +262,12 @@ tasks:
    `.mise.toml`, `CHANGELOG.md`, `Taskfile.yml` → `packages/crit-cli/`
 3. **Move plugin files** — `plugin/crit/` → `packages/claude-code/`
 4. **Create symlink** — `packages/copilot/skills -> ../claude-code/skills`
-5. **Move opencode sources** — `internal/cli/opencode/*.md` → `packages/opencode/commands/`
+5. **Move opencode sources** — `plugin/crit/opencode/*.md` → `packages/opencode/commands/`
 6. **Move demos/assets** — `demo/` → `docs/demo/`, `assets/` → `docs/assets/`
-7. **Add Taskfile `sync` step** — generates `internal/cli/embed/` before build
-8. **Update `.gitignore`** — add `packages/crit-cli/internal/cli/embed/`, `.opencode/`
-9. **Update `go:embed` paths** — point to `./embed/claude-code/` and `./embed/opencode/`
+7. **Remove `//go:embed` and `embed.FS`** from all `setup_*.go` files (already done)
+8. **Update default URLs** in `source.go` to point to `packages/claude-code/skills`
+   and `packages/opencode/commands`
+9. **Update `.gitignore`** — ensure `dist/`, `.opencode/`, `.claude/` are ignored
 10. **Update `marketplace.json`** — use relative path `./packages/claude-code`
 11. **Update `README.md`** — fix asset/demo paths; update install instructions
 
@@ -273,11 +277,12 @@ tasks:
 
 | Benefit | Cost |
 |---------|------|
-| Single source of truth for skills/commands | Requires `task sync` before build |
+| Skills/commands update without a CLI release | Requires internet access at setup time |
+| No binary bloat from embedded markdown | Must handle network errors gracefully |
 | Symlink eliminates Copilot duplicate | Symlinks need care in `.gitattributes` |
 | Clear per-agent ownership | More directories at top level |
 | `init-*` tasks for local AI agent config | Developers must run `task init-opencode` etc. |
-| All docs/demos in one place | Update image paths in README |
+| Offline use via local path in config | Extra step to configure config file |
 
 ---
 
@@ -285,9 +290,11 @@ tasks:
 
 | Concern | Current | Monorepo alternative |
 |---------|---------|---------------------|
-| Skills source of truth | Two copies (`[Layer C]` + `[Layer B:copilot]`) | One copy in `packages/claude-code/skills/` |
+| Skills source of truth | Two copies (`internal/cli/skill/` + `plugin/crit/skills/`) | One copy in `packages/claude-code/skills/` |
+| Binary embedding | `//go:embed` in `setup_claude.go`, `setup_opencode.go` | **Removed** — download at runtime |
 | AI agent directories | Mixed under `plugin/` and `internal/cli/` | Dedicated `packages/<agent>/` |
 | CLI source location | Repository root | `packages/crit-cli/` |
 | Demo/asset location | `demo/` and `assets/` at root | `docs/demo/` and `docs/assets/` |
 | Marketplace source | Relative path `./plugin/crit` | Relative `./packages/claude-code` |
 | `[Layer D:opencode]` | `.opencode/` committed | `.opencode/` git-ignored; created by `task init-opencode` |
+| Skill/command update | Requires new CLI release | Update files in repo — CLI picks up on next `setup-*` run |

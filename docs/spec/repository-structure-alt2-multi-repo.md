@@ -1,6 +1,6 @@
 ---
 title: "Alternative Repository Structure — Multi-Repo Split"
-description: "A proposed split of the crit repository into separate repositories for the CLI tool, the Claude Code plugin, and other AI agent integrations."
+description: "A proposed split of the crit repository into separate repositories for the CLI tool, the Claude Code plugin, and other AI agent integrations.  The CLI binary embeds no content — it downloads skills and commands from the respective plugin repos at setup time."
 last_updated: "2025-03-09"
 ---
 
@@ -23,7 +23,8 @@ monorepo alternative.
 | CLI has zero coupling to plugin distribution | `crit-cli` knows nothing about Claude Code or Copilot — it is a pure Go tool |
 | Plugin repos are independently versioned | Skill descriptions can change without a CLI release |
 | Each integration can be contributed to independently | Plugin authors need no Go knowledge |
-| CLI setup commands stay useful | `crit setup-*` fetches from the respective plugin repos at install time |
+| CLI setup commands stay useful | `crit setup-*` downloads from the respective plugin repos at install time |
+| No binary embedding | Content lives in plugin repos; CLI fetches it via HTTP or local path |
 
 ---
 
@@ -66,10 +67,11 @@ crit/
 │   │   ├── review.go
 │   │   ├── review_test.go
 │   │   ├── root.go
-│   │   ├── setup.go                  # Shared installer helpers
-│   │   ├── setup_claude.go           # [Layer C:claude-code] Downloads/embeds skills
-│   │   ├── setup_copilot.go          # [Layer C:copilot]     Downloads/embeds skills
-│   │   ├── setup_opencode.go         # [Layer C:opencode]    Downloads/embeds commands
+│   │   ├── setup.go                  # Shared installer helpers (FetchFile, resolveTargetDir)
+│   │   ├── setup_claude.go           # [Layer C:claude-code] Downloads skills at setup time
+│   │   ├── setup_copilot.go          # [Layer C:copilot]     Downloads skills at setup time
+│   │   ├── setup_opencode.go         # [Layer C:opencode]    Downloads commands at setup time
+│   │   ├── source.go                 # Config, LoadConfig, ResolveSource, FetchFile
 │   │   └── status.go
 │   ├── document/
 │   ├── git/
@@ -87,17 +89,36 @@ crit/
     └── plan.md
 ```
 
+**Key properties of `crit` in the multi-repo model:**
+
+- **Zero embedded markdown** — no `//go:embed`, no `internal/cli/skill/`,
+  no `internal/cli/opencode/` directories committed.
+- **`source.go`** provides `FetchFile(source, relPath)` which handles both HTTP URLs
+  and local filesystem paths (with `~/` expansion).
+- **Default URLs** in `source.go` point to the respective plugin repos:
+
+```go
+const (
+    DefaultSkillsURL   = "https://raw.githubusercontent.com/tobiashochguertel/crit-claude-code/main/plugin/skills"
+    DefaultCommandsURL = "https://raw.githubusercontent.com/tobiashochguertel/crit-opencode/main/commands"
+)
+```
+
+- **Source resolution order** (first non-empty wins):
+
+```
+--source <path|url>        CLI flag (local dir or HTTP(S) URL base)
+$CRIT_SKILLS_DIR           Environment variable (for skills)
+$CRIT_OPENCODE_DIR         Environment variable (for opencode commands)
+skills_url: in config      ~/.config/crit/config.yaml
+commands_url: in config    ~/.config/crit/config.yaml
+(default URL)              (constants above)
+```
+
 > **Note — `.opencode/` is git-ignored.**  Run `task init-opencode` to create
 > `.opencode/commands/` locally as **[Layer D:opencode]**.  Similarly `task init-claude`
 > and `task init-copilot` create project-local AI agent config for contributors who
 > use those tools while working on the CLI.
-
-**What is removed compared to today:**
-- `plugin/` directory — moved to `crit-claude-code`
-- `.claude-plugin/` at root — moved to `crit-claude-code`
-- `internal/cli/skill/` embedded skills — replaced by download-at-install approach
-- `internal/cli/opencode/` embedded commands — replaced by download-at-install approach
-- `docs/ai-agent-plugins/` — kept but now just links to each plugin repo's own docs
 
 ### `tobiashochguertel/crit-claude-code` (Claude Code marketplace + plugin)
 
@@ -114,8 +135,8 @@ crit-claude-code/
 │   │   ├── review.md
 │   │   ├── code-review.md
 │   │   └── plan-review.md
-│   └── skills/                       # ★ SINGLE SOURCE OF TRUTH for SKILL.md files
-│       ├── crit-review/
+│   └── skills/                       # ★ CANONICAL source for SKILL.md files
+│       ├── crit-review/              #   Downloaded by `crit setup-claude` and `crit setup-copilot`
 │       │   └── SKILL.md
 │       ├── crit-code-review/
 │       │   └── SKILL.md
@@ -126,6 +147,11 @@ crit-claude-code/
 │   └── installation.md               # Claude Code install instructions
 │
 └── README.md
+```
+
+`DefaultSkillsURL` in `source.go` points to:
+```
+https://raw.githubusercontent.com/tobiashochguertel/crit-claude-code/main/plugin/skills
 ```
 
 Users add the marketplace:
@@ -144,7 +170,7 @@ Or install directly:
 ```tree
 crit-copilot/
 ├── skills/                           # [Layer B:copilot] SKILL.md files
-│   ├── crit-review/
+│   ├── crit-review/                  #   Downloaded by `crit setup-copilot`
 │   │   └── SKILL.md
 │   ├── crit-code-review/
 │   │   └── SKILL.md
@@ -157,12 +183,16 @@ crit-copilot/
 └── README.md                         # Copy to ~/.copilot/skills/ or use `crit setup-copilot`
 ```
 
+> When Copilot CLI skills are format-compatible with Claude Code skills,
+> `crit-copilot` can simply reference `crit-claude-code/plugin/skills` via GitHub
+> Actions sync, avoiding duplication.  See the [symlink approach in alt1](./repository-structure-alt1-monorepo.md#2-packagescopolit--symlinked-skills).
+
 ### `tobiashochguertel/crit-opencode` (opencode custom commands)
 
 ```tree
 crit-opencode/
 ├── commands/                         # [Layer C:opencode] opencode command files
-│   ├── crit-review.md
+│   ├── crit-review.md                #   Downloaded by `crit setup-opencode`
 │   ├── crit-code-review.md
 │   └── crit-plan-review.md
 │
@@ -172,67 +202,42 @@ crit-opencode/
 └── README.md                         # Copy to ~/.config/opencode/commands/ or use `crit setup-opencode`
 ```
 
----
-
-## How the CLI `setup-*` commands work in the split model
-
-In the current structure, `setup_claude.go` uses `//go:embed` to bundle skill files
-directly in the binary.  With a multi-repo split, three approaches are possible:
-
-### Approach 1: Static embed with pinned version (recommended)
-
-A `fetch-skills` Taskfile task downloads skill files at release time and commits them
-to `internal/cli/skill/` + `internal/cli/opencode/`.  The `go:embed` directives remain
-unchanged.
-
-```yaml
-# Taskfile.yml — fetch step run during release (not on every build)
-fetch-skills:
-  desc: "Download skill files from crit-claude-code at the tagged release version"
-  vars:
-    VER: "v1.0.2"
-  cmds:
-    - rm -rf internal/cli/skill/ internal/cli/opencode/
-    - mkdir -p internal/cli/skill/crit-review internal/cli/skill/crit-code-review internal/cli/skill/crit-plan-review
-    - mkdir -p internal/cli/opencode
-    - curl -sSL "https://raw.githubusercontent.com/tobiashochguertel/crit-claude-code/{{.VER}}/plugin/skills/crit-review/SKILL.md"
-           -o internal/cli/skill/crit-review/SKILL.md
-    - curl -sSL "https://raw.githubusercontent.com/tobiashochguertel/crit-opencode/{{.VER}}/commands/crit-review.md"
-           -o internal/cli/opencode/crit-review.md
+`DefaultCommandsURL` in `source.go` points to:
+```
+https://raw.githubusercontent.com/tobiashochguertel/crit-opencode/main/commands
 ```
 
-**Pros:** Self-contained binary; no runtime network access required.  
-**Cons:** Skills and CLI versions are coupled; a skill-only update still requires a CLI release.
+---
 
-### Approach 2: Runtime download at `setup` time
+## How `setup-*` works in the multi-repo model
 
-`setup_claude.go` downloads the latest skills from GitHub at runtime:
+`crit setup-claude` (and the other `setup-*` subcommands) call `FetchFile(source, relPath)` for
+each file to install:
 
 ```go
-const skillsBaseURL = "https://raw.githubusercontent.com/tobiashochguertel/crit-claude-code/main/plugin/skills/"
-
-func downloadSkill(name, targetPath string) error {
-    url := skillsBaseURL + name + "/SKILL.md"
-    resp, err := http.Get(url)
-    // ... write to targetPath
+// source.go — used by all three setup_*.go files
+func FetchFile(source, relPath string) ([]byte, error) {
+    if IsURL(source) {
+        url := strings.TrimRight(source, "/") + "/" + relPath
+        resp, err := http.Get(url)
+        // ...
+        return io.ReadAll(resp.Body)
+    }
+    // Local path — useful during development or offline use
+    return os.ReadFile(filepath.Join(source, filepath.FromSlash(relPath)))
 }
 ```
 
-**Pros:** Skills stay up to date independently of the CLI version.  
-**Cons:** Requires internet access at setup time; tests need network mocking.
+This means:
 
-### Approach 3: Separate install scripts (no embedding)
+- **Online (default):** CLI fetches the latest file from the plugin repo over HTTPS.
+- **Offline / dev:** Set `$CRIT_SKILLS_DIR` to a local checkout of `crit-claude-code`
+  or write the path to `~/.config/crit/config.yaml`.
+- **Custom / self-hosted:** Point to any HTTP server or Gitea/GitHub instance that serves
+  the same directory structure.
 
-Each plugin repo includes an `install.sh`.  Users run:
-```bash
-curl -sSL https://raw.githubusercontent.com/tobiashochguertel/crit-claude-code/main/install.sh | bash
-```
-
-**Pros:** CLI binary is completely decoupled from plugin files.  
-**Cons:** More friction for users; shell-pipe installs carry security risks.
-
-**Recommendation:** Use **Approach 1** for simplicity and reproducible releases.
-Move to **Approach 2** once the skill format stabilizes.
+**No new CLI release is needed when a skill description changes** — the next time a user
+runs `crit setup-claude`, the updated file is downloaded automatically.
 
 ---
 
@@ -250,13 +255,27 @@ crit-plugins/
 │   ├── .claude-plugin/
 │   │   └── plugin.json
 │   ├── commands/                     # [Layer A:claude-code]
-│   └── skills/                       # ★ Single source of truth for SKILL.md files
+│   └── skills/                       # ★ Canonical SKILL.md source
+│       ├── crit-review/SKILL.md
+│       ├── crit-code-review/SKILL.md
+│       └── crit-plan-review/SKILL.md
 │
 ├── copilot/                          # [Layer B:copilot] Skills for GitHub Copilot CLI
 │   └── skills -> ../claude-code/skills  # ★ Symlink — same format, no duplication
 │
 └── opencode/                         # [Layer C:opencode] Commands for opencode
     └── commands/
+        ├── crit-review.md
+        ├── crit-code-review.md
+        └── crit-plan-review.md
+```
+
+Default URLs in `source.go` would then be:
+```go
+const (
+    DefaultSkillsURL   = "https://raw.githubusercontent.com/tobiashochguertel/crit-plugins/main/claude-code/skills"
+    DefaultCommandsURL = "https://raw.githubusercontent.com/tobiashochguertel/crit-plugins/main/opencode/commands"
+)
 ```
 
 `marketplace.json` references `./claude-code/` as the plugin source.
@@ -278,9 +297,10 @@ Options for expressing this:
 | CHANGELOG + manual coordination | Low friction; relies on convention |
 | Git tags with a shared prefix | `plugins/v1.0.2` tag in each plugin repo |
 | Compatibility matrix in `crit` README | Table mapping CLI ↔ plugin versions |
-| Git submodules in `crit` pointing to each plugin repo | `git submodule update --remote` to update |
+| Pinned URLs in `config.yaml` | Users can lock to a specific tag via `?ref=v1.0.2` |
 
-**Recommendation for now:** Document the matrix in `README.md`.
+**Recommendation for now:** Document the matrix in `README.md`.  Users who need a pinned
+version can override `skills_url` in `~/.config/crit/config.yaml`.
 
 ---
 
@@ -289,13 +309,14 @@ Options for expressing this:
 | Concern | Monorepo (Alt 1) | Multi-repo (Alt 2) |
 |---------|-----------------|-------------------|
 | **Setup complexity** | One repo, one clone | Four repos, cross-repo coordination |
-| **Skills duplication** | Solved by `sync` task | Solved by separate canonical repos |
-| **Plugin updates without CLI release** | Not possible (sync is at build time) | ✅ Yes (Approach 2) |
+| **Skills duplication** | Solved by symlink | Solved by separate canonical repos |
+| **Plugin updates without CLI release** | ✅ Yes (runtime download) | ✅ Yes (runtime download) |
 | **Claude Code `git-subdir` for plugins** | Points inside the monorepo | Points to dedicated plugin repo |
 | **Contributor onboarding** | Clone one repo | Must find the right repo |
 | **Release process** | Single GoReleaser workflow | Per-repo releases |
 | **Breaking the "marketplace + CLI" coupling** | Partial (still one repo) | ✅ Complete separation |
 | **`[Layer D:opencode]`** | git-ignored; `task init-opencode` | git-ignored; `task init-opencode` |
+| **Binary size** | Small (no embedded markdown) | Small (no embedded markdown) |
 
 ---
 
@@ -304,20 +325,26 @@ Options for expressing this:
 1. **Create `tobiashochguertel/crit-claude-code`** — `gh repo create tobiashochguertel/crit-claude-code --public`
 2. **Copy plugin files** — `plugin/crit/` + `.claude-plugin/` → new repo
 3. **Create `tobiashochguertel/crit-copilot`** — copy `plugin/crit/skills/` → `skills/`
-4. **Create `tobiashochguertel/crit-opencode`** — copy `internal/cli/opencode/*.md` → `commands/`
-5. **Add `fetch-skills` Taskfile target** in `crit` repo
-6. **Run `task fetch-skills`** to populate `internal/cli/skill/` from the new repos
-7. **Remove `plugin/`, `.claude-plugin/`, `internal/cli/opencode/`** from `crit`
-8. **Update `README.md`** — add links to each plugin repo; update install instructions
-9. **Tag first release** on each plugin repo (`v1.0.0`)
-10. **Update `crit` CHANGELOG** — document the split
+4. **Create `tobiashochguertel/crit-opencode`** — copy `plugin/crit/opencode/*.md` → `commands/`
+5. **Update `DefaultSkillsURL` and `DefaultCommandsURL`** in `source.go` to point to the new repos
+6. **Remove `plugin/`, `.claude-plugin/`** from `crit` (no longer needed in the CLI repo)
+7. **Update `README.md`** — add links to each plugin repo; update install instructions
+8. **Tag first release** on each plugin repo (`v1.0.0`)
+9. **Update `crit` CHANGELOG** — document the split
+
+> **Steps 5 and 6 are straightforward** because `//go:embed` has already been removed
+> from the CLI source.  The only code change is updating the two URL constants.
 
 ---
 
 ## Summary
 
 The multi-repo split gives the cleanest separation between the CLI tool and its AI agent
-integrations.  The cost is cross-repository coordination and a slightly more complex
-`setup-*` implementation.  The minimal `crit-plugins` variant (one plugin repo instead
-of three) is a pragmatic middle ground that reduces overhead while still decoupling the
-CLI binary from the plugin distribution.
+integrations.  Because `//go:embed` is already removed from the CLI source, the only
+remaining coupling is the two `DefaultSkillsURL` / `DefaultCommandsURL` constants in
+`source.go`.  Updating those constants and creating the plugin repos is all that is needed
+to complete the transition.
+
+The minimal `crit-plugins` variant (one plugin repo instead of three) is a pragmatic
+middle ground that reduces overhead while still decoupling the CLI binary from the plugin
+distribution.
