@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+permissions: {}
+
+jobs:
+  test-platform:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Cache poisoning is not a concern here; this job only runs tests and
+      # publishes nothing.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0 # zizmor: ignore[cache-poisoning]
+        with:
+          go-version-file: go.mod
+
+      - name: Check formatting
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - run: go vet ./...
+
+      - run: go test ./...
+
+      - name: Test AI reviewer permissions
+        run: |
+          set -euo pipefail
+          python3 e2e/claude_review_gate_test.py
+          python3 -m venv "$RUNNER_TEMP/review-venv"
+          "$RUNNER_TEMP/review-venv/bin/python3" -m pip install -r internal/cli/skill/critty-ai-review/scripts/codex-review-requirements.txt
+          "$RUNNER_TEMP/review-venv/bin/python3" e2e/codex_review_server_test.py
+
+      - name: Install tmux for E2E scenarios
+        run: |
+          set -euo pipefail
+          if ! command -v tmux >/dev/null 2>&1; then
+            if [ "$RUNNER_OS" = "Linux" ]; then
+              sudo apt-get update
+              sudo apt-get install -y tmux
+            else
+              brew install tmux
+            fi
+          fi
+
+      - name: Test CLI and TUI review scenarios
+        run: python3 e2e/scenarios.py
+
+      - name: Test doctor image diagnostics
+        run: python3 e2e/doctor_images_test.py
+
+      - name: Test demo release script
+        run: sh demo/release_test.sh
+
+  # Keep the required check stable for branch protection and Mergify.
+  test:
+    needs: test-platform
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all platforms to pass
+        env:
+          RESULT: ${{ needs.test-platform.result }}
+        run: test "$RESULT" = success

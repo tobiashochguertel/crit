@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"unicode"
 
+	"github.com/aymanbagabas/go-udiff/lcs"
 	"github.com/bluekeyes/go-gitdiff/gitdiff"
 )
 
@@ -20,11 +22,44 @@ const (
 	StatusBinary
 )
 
+// String returns the review.json status string for a change status.
+func (s ChangeStatus) String() string {
+	switch s {
+	case StatusAdded:
+		return "added"
+	case StatusDeleted:
+		return "deleted"
+	case StatusRenamed:
+		return "renamed"
+	case StatusUntracked:
+		return "untracked"
+	case StatusBinary:
+		return "binary"
+	default:
+		return "modified"
+	}
+}
+
 // FileChange describes a single changed file.
 type FileChange struct {
 	Path    string
 	Status  ChangeStatus
 	OldPath string // for renames
+	Binary  bool
+}
+
+// IsBinary also recognizes snapshots saved before binary detection was
+// separated from the change status.
+func (f FileChange) IsBinary() bool {
+	return f.Binary || f.Status == StatusBinary
+}
+
+// ReviewStatus preserves the Crit-compatible status for binary files.
+func (f FileChange) ReviewStatus() string {
+	if f.IsBinary() {
+		return StatusBinary.String()
+	}
+	return f.Status.String()
 }
 
 // ChangedFiles returns files with changes relative to HEAD (staged + unstaged + untracked).
@@ -32,27 +67,36 @@ func ChangedFiles() ([]FileChange, error) {
 	return ChangedFilesFrom("HEAD")
 }
 
+// ChangedFilesStaged returns files changed in the index relative to HEAD.
+func ChangedFilesStaged() ([]FileChange, error) {
+	return changedFilesFrom("HEAD", true)
+}
+
 // ChangedFilesFrom returns files changed relative to a ref (branch, commit, HEAD~N).
 func ChangedFilesFrom(ref string) ([]FileChange, error) {
-	files, err := diffNameStatus(ref)
+	return changedFilesFrom(ref, false)
+}
+
+func changedFilesFrom(ref string, staged bool) ([]FileChange, error) {
+	files, err := diffNameStatus(ref, staged)
 	if err != nil {
 		return nil, err
 	}
 
 	// Detect binary files via --numstat (binary shows - - for counts)
-	binaries, err := detectBinaryFiles(ref)
+	binaries, err := detectBinaryFiles(ref, staged)
 	if err != nil {
 		return nil, err
 	}
 
 	for i := range files {
 		if binaries[files[i].Path] {
-			files[i].Status = StatusBinary
+			files[i].Binary = true
 		}
 	}
 
 	// Add untracked files (only for HEAD-based diffs)
-	if ref == "HEAD" {
+	if ref == "HEAD" && !staged {
 		untracked, err := untrackedFiles()
 		if err != nil {
 			return nil, err
@@ -70,19 +114,45 @@ func ChangedFilesFrom(ref string) ([]FileChange, error) {
 
 // DiffInfo contains parsed diff information for a single file.
 type DiffInfo struct {
-	ChangedLines map[int]bool          // added/modified line numbers (1-based) in new file
-	DeletedAfter map[int][]DeletedLine // deleted lines keyed by the new-file line they appear after (0 = before line 1)
+	ChangedLines  map[int]bool            // added/modified line numbers (1-based) in new file
+	InlineChanges map[int][]InlineSegment // inline changes keyed by new-file line number
+	DeletedAfter  map[int][]DeletedLine   // deleted lines keyed by the new-file line they appear after (0 = before line 1)
 }
 
 // DeletedLine represents a line that was deleted from the old version.
 type DeletedLine struct {
 	OldLineNum int
 	Content    string
+	Inline     []InlineSegment
 }
 
-// DiffFile returns full diff information for a file relative to the given ref.
-func DiffFile(path string, ref string) (*DiffInfo, error) {
-	out, err := gitCommand("diff", ref, "--", path)
+// InlineSegment is a changed or unchanged portion of a replacement line.
+type InlineSegment struct {
+	Content string
+	Changed bool
+}
+
+// DiffFile returns full diff information for a file relative to the given
+// ref.  oldPath is the file's previous path when it was renamed, else "".
+func DiffFile(path, oldPath, ref string) (*DiffInfo, error) {
+	return diffFile(path, oldPath, ref, false)
+}
+
+// DiffFileStaged returns diff information for the indexed version of a file.
+// oldPath is the file's previous path when it was renamed, else "".
+func DiffFileStaged(path, oldPath string) (*DiffInfo, error) {
+	return diffFile(path, oldPath, "HEAD", true)
+}
+
+func diffFile(path, oldPath, ref string, staged bool) (*DiffInfo, error) {
+	args := []string{"diff", "--find-renames"}
+	if staged {
+		args = append(args, "--cached")
+	} else {
+		args = append(args, ref)
+	}
+	args = append(args, diffPathspec(path, oldPath)...)
+	out, err := gitCommand(args...)
 	if err != nil {
 		return nil, fmt.Errorf("git diff for %s: %w", path, err)
 	}
@@ -96,17 +166,37 @@ func DiffFile(path string, ref string) (*DiffInfo, error) {
 		return nil, fmt.Errorf("parsing diff for %s: %w", path, err)
 	}
 
+	return diffInfo(files), nil
+}
+
+// diffPathspec limits a diff to path.  A renamed file's previous path is
+// included so Git pairs both sides instead of reporting a new file whose
+// every line was added.
+func diffPathspec(path, oldPath string) []string {
+	if oldPath != "" && oldPath != path {
+		return []string{"--", oldPath, path}
+	}
+	return []string{"--", path}
+}
+
+func diffInfo(files []*gitdiff.File) *DiffInfo {
 	info := &DiffInfo{
-		ChangedLines: make(map[int]bool),
-		DeletedAfter: make(map[int][]DeletedLine),
+		ChangedLines:  make(map[int]bool),
+		InlineChanges: make(map[int][]InlineSegment),
+		DeletedAfter:  make(map[int][]DeletedLine),
 	}
 
 	for _, f := range files {
 		for _, frag := range f.TextFragments {
 			newLine := frag.NewPosition
 			oldLine := frag.OldPosition
-			// Track the last new-file line we've seen (for anchoring deletions)
-			lastNewLine := int(newLine) - 1 // before the hunk starts
+			// Track the last new-file line we've seen (for anchoring deletions).
+			// A hunk with no new-side lines (a deleted file) starts at
+			// position 0, which still anchors before line 1.
+			lastNewLine := max(int(newLine)-1, 0)
+			if frag.NewLines == 0 {
+				lastNewLine = int(newLine)
+			}
 
 			for _, line := range frag.Lines {
 				switch line.Op {
@@ -127,45 +217,179 @@ func DiffFile(path string, ref string) (*DiffInfo, error) {
 					oldLine++
 				}
 			}
+			annotateInlineChanges(info, frag)
 		}
 	}
 
-	return info, nil
+	return info
+}
+
+func annotateInlineChanges(info *DiffInfo, frag *gitdiff.TextFragment) {
+	oldLine := int(frag.OldPosition)
+	newLine := int(frag.NewPosition)
+	for i := 0; i < len(frag.Lines); {
+		if frag.Lines[i].Op != gitdiff.OpDelete {
+			switch frag.Lines[i].Op {
+			case gitdiff.OpAdd:
+				newLine++
+			case gitdiff.OpContext:
+				oldLine++
+				newLine++
+			}
+			i++
+			continue
+		}
+
+		var deleted []struct {
+			line    int
+			content string
+		}
+		for i < len(frag.Lines) && frag.Lines[i].Op == gitdiff.OpDelete {
+			deleted = append(deleted, struct {
+				line    int
+				content string
+			}{oldLine, strings.TrimSuffix(frag.Lines[i].Line, "\n")})
+			oldLine++
+			i++
+		}
+
+		var added []struct {
+			line    int
+			content string
+		}
+		for i < len(frag.Lines) && frag.Lines[i].Op == gitdiff.OpAdd {
+			added = append(added, struct {
+				line    int
+				content string
+			}{newLine, strings.TrimSuffix(frag.Lines[i].Line, "\n")})
+			newLine++
+			i++
+		}
+
+		if len(deleted) != len(added) {
+			continue
+		}
+		for j := range deleted {
+			oldSegments, newSegments := inlineDiff(deleted[j].content, added[j].content)
+			info.InlineChanges[added[j].line] = newSegments
+			setDeletedInline(info, deleted[j].line, oldSegments)
+		}
+	}
+}
+
+func inlineDiff(before, after string) ([]InlineSegment, []InlineSegment) {
+	beforeTokens := splitInlineTokens(before)
+	afterTokens := splitInlineTokens(after)
+	diffs := lcs.DiffLines(beforeTokens, afterTokens)
+	if len(diffs) == 0 {
+		return nil, nil
+	}
+
+	oldSegments := make([]InlineSegment, 0, len(diffs)*2+1)
+	newSegments := make([]InlineSegment, 0, len(diffs)*2+1)
+	lastEnd := 0
+	for _, diff := range diffs {
+		common := strings.Join(beforeTokens[lastEnd:diff.Start], "")
+		oldSegments = appendInlineSegment(oldSegments, common, false)
+		newSegments = appendInlineSegment(newSegments, common, false)
+		oldSegments = appendInlineSegment(oldSegments, strings.Join(beforeTokens[diff.Start:diff.End], ""), true)
+		newSegments = appendInlineSegment(newSegments, strings.Join(afterTokens[diff.ReplStart:diff.ReplEnd], ""), true)
+		lastEnd = diff.End
+	}
+	common := strings.Join(beforeTokens[lastEnd:], "")
+	oldSegments = appendInlineSegment(oldSegments, common, false)
+	newSegments = appendInlineSegment(newSegments, common, false)
+	return oldSegments, newSegments
+}
+
+// splitInlineTokens preserves each whitespace run with the word before it, so
+// word-level matching can reconstruct the original line exactly.
+func splitInlineTokens(text string) []string {
+	if text == "" {
+		return nil
+	}
+
+	var tokens []string
+	start := 0
+	previousWasSpace := false
+	for i, r := range text {
+		isSpace := unicode.IsSpace(r)
+		if !isSpace && previousWasSpace {
+			tokens = append(tokens, text[start:i])
+			start = i
+		}
+		previousWasSpace = isSpace
+	}
+	return append(tokens, text[start:])
+}
+
+func appendInlineSegment(segments []InlineSegment, content string, changed bool) []InlineSegment {
+	if content == "" {
+		return segments
+	}
+	if len(segments) > 0 && segments[len(segments)-1].Changed == changed {
+		segments[len(segments)-1].Content += content
+		return segments
+	}
+	return append(segments, InlineSegment{Content: content, Changed: changed})
+}
+
+func setDeletedInline(info *DiffInfo, oldLine int, segments []InlineSegment) {
+	for anchor := range info.DeletedAfter {
+		for i := range info.DeletedAfter[anchor] {
+			if info.DeletedAfter[anchor][i].OldLineNum == oldLine {
+				info.DeletedAfter[anchor][i].Inline = segments
+				return
+			}
+		}
+	}
 }
 
 // diffNameStatus runs git diff --name-status and parses the output.
-func diffNameStatus(ref string) ([]FileChange, error) {
-	out, err := gitCommand("diff", ref, "--name-status")
+// It uses -z so paths with spaces, tabs, or non-ASCII characters arrive
+// unquoted and NUL-separated.
+func diffNameStatus(ref string, staged bool) ([]FileChange, error) {
+	args := []string{"diff"}
+	if staged {
+		args = append(args, "--cached")
+	} else {
+		args = append(args, ref)
+	}
+	args = append(args, "--name-status", "-z")
+	out, err := gitCommand(args...)
 	if err != nil {
 		return nil, fmt.Errorf("git diff --name-status: %w", err)
 	}
+	return parseNameStatusZ(out), nil
+}
+
+// parseNameStatusZ parses NUL-separated `git diff --name-status -z` output:
+// each entry is a status token followed by one path, or two paths for
+// renames and copies.
+func parseNameStatusZ(out string) []FileChange {
+	tokens := strings.Split(out, "\x00")
 
 	var files []FileChange
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if line == "" {
-			continue
-		}
-		parts := strings.Fields(line)
-		if len(parts) < 2 {
+	for i := 0; i+1 < len(tokens); {
+		status := tokens[i]
+		if status == "" {
+			i++
 			continue
 		}
 
-		status := parts[0]
-		path := parts[1]
-
-		fc := FileChange{Path: path}
+		fc := FileChange{Path: tokens[i+1]}
+		i += 2
 		switch {
-		case status == "M":
-			fc.Status = StatusModified
 		case status == "A":
 			fc.Status = StatusAdded
 		case status == "D":
 			fc.Status = StatusDeleted
-		case strings.HasPrefix(status, "R"):
+		case strings.HasPrefix(status, "R"), strings.HasPrefix(status, "C"):
 			fc.Status = StatusRenamed
-			if len(parts) >= 3 {
-				fc.OldPath = parts[1]
-				fc.Path = parts[2]
+			if i < len(tokens) {
+				fc.OldPath = fc.Path
+				fc.Path = tokens[i]
+				i++
 			}
 		default:
 			fc.Status = StatusModified
@@ -174,42 +398,72 @@ func diffNameStatus(ref string) ([]FileChange, error) {
 		files = append(files, fc)
 	}
 
-	return files, nil
+	return files
 }
 
 // detectBinaryFiles returns a set of paths that are binary.
-func detectBinaryFiles(ref string) (map[string]bool, error) {
-	out, err := gitCommand("diff", ref, "--numstat")
+func detectBinaryFiles(ref string, staged bool) (map[string]bool, error) {
+	args := []string{"diff"}
+	if staged {
+		args = append(args, "--cached")
+	} else {
+		args = append(args, ref)
+	}
+	args = append(args, "--numstat", "-z")
+	out, err := gitCommand(args...)
 	if err != nil {
 		return nil, fmt.Errorf("git diff --numstat: %w", err)
 	}
+	return parseNumstatZ(out), nil
+}
 
+// FileContentFromIndex returns a file's staged content.
+func FileContentFromIndex(path string) ([]byte, error) {
+	out, err := gitCommand("show", ":"+path)
+	if err != nil {
+		return nil, fmt.Errorf("reading staged file %s: %w", path, err)
+	}
+	return []byte(out), nil
+}
+
+// parseNumstatZ parses NUL-separated `git diff --numstat -z` output.
+// Each entry is "added\tdeleted\tpath"; binary files show "-" for both
+// counts. For renames and copies the path field is empty and the old and
+// new paths follow as two separate NUL-terminated tokens.
+func parseNumstatZ(out string) map[string]bool {
 	binaries := make(map[string]bool)
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if line == "" {
+	tokens := strings.Split(out, "\x00")
+	for i := 0; i < len(tokens); i++ {
+		parts := strings.SplitN(tokens[i], "\t", 3)
+		if len(parts) < 3 {
 			continue
 		}
-		// Binary files show "-\t-\tpath"
-		if strings.HasPrefix(line, "-\t-\t") {
-			path := strings.TrimPrefix(line, "-\t-\t")
+
+		binary := parts[0] == "-" && parts[1] == "-"
+		path := parts[2]
+		if path == "" && i+2 < len(tokens) {
+			path = tokens[i+2]
+			i += 2
+		}
+		if binary && path != "" {
 			binaries[path] = true
 		}
 	}
 
-	return binaries, nil
+	return binaries
 }
 
 // untrackedFiles returns untracked file paths.
 func untrackedFiles() ([]string, error) {
-	out, err := gitCommand("ls-files", "--others", "--exclude-standard")
+	out, err := gitCommand("ls-files", "--others", "--exclude-standard", "-z")
 	if err != nil {
 		return nil, fmt.Errorf("git ls-files: %w", err)
 	}
 
 	var paths []string
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if line != "" {
-			paths = append(paths, line)
+	for _, path := range strings.Split(out, "\x00") {
+		if path != "" {
+			paths = append(paths, path)
 		}
 	}
 	return paths, nil
@@ -232,4 +486,13 @@ func gitCommand(args ...string) (string, error) {
 func IsGitRepo() bool {
 	_, err := gitCommand("rev-parse", "--is-inside-work-tree")
 	return err == nil
+}
+
+// CurrentBranch returns the current branch name, or "HEAD" when detached.
+func CurrentBranch() (string, error) {
+	out, err := gitCommand("rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
 }

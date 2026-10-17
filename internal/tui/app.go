@@ -2,23 +2,28 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
 	"os"
 	"path/filepath"
-	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
+	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
-	"github.com/google/uuid"
+	uv "github.com/charmbracelet/ultraviolet"
+	"github.com/charmbracelet/x/ansi"
 
-	"github.com/kevindutra/crit/internal/document"
-	gitpkg "github.com/kevindutra/crit/internal/git"
-	"github.com/kevindutra/crit/internal/review"
+	"github.com/crittylabs/critty/internal/document"
+	gitpkg "github.com/crittylabs/critty/internal/git"
+	"github.com/crittylabs/critty/internal/review"
 )
 
 type pane int
@@ -33,39 +38,221 @@ type modalType int
 const (
 	noModal modalType = iota
 	commentModal
+	fileCommentModal
+	replyModal
 	editModal
+	discardChangesModal
+	deleteConfirmModal
+	finishModal
+	finishResolveModal
+	finishFormsModal
+	finishAbortModal
+	helpModal
+	gotoLineModal
+	openSourceModal
+	fileSelectModal
+	lightboxModal
 )
+
+// FinishEvent is emitted on the finish channel when the reviewer finishes a
+// round.  The runner turns it into a payload for blocked agent clients.
+type FinishEvent struct {
+	Approved bool
+	Result   *review.FormResult
+}
+
+// AppConfig carries the cross-cutting dependencies of the TUI.
+type AppConfig struct {
+	Documents []review.AttachedDocument
+	Project   string
+	Topic     string
+	Version   string
+	Session   *review.Session
+	Author    string
+	// Staged reads code-review files and diffs from the Git index.
+	Staged    bool
+	Patch     *gitpkg.Patch
+	Source    *gitpkg.ReviewSource
+	FinishCh  chan<- FinishEvent
+	FocusPath string
+	FocusLine int
+}
 
 // gutterWidth is the total width of the left gutter: line number (5) + marker (1) + space (1).
 const gutterWidth = 7
 
+const displayTabWidth = 4
+
 type AppModel struct {
+	images        imageDisplay
+	commentImages map[commentImageKey]*previewSide
+	imageBodies   map[string][]markdownImageRef
+	editorImages  editorImageState
+	lightbox      lightboxState
+	forms         *review.FormState
+	formRows      map[string]map[int]formRow
+	formViewed    map[string]map[int]bool
+	attachments   map[string]review.AttachedDocument
+	project       string
+	topic         string
+	version       string
 	width, height int
 	focused       pane
 	modal         modalType
 
 	// Multi-file tabs (code review mode)
-	tabs         []FileTab
-	activeTab    int
-	multiFile    bool // true when in code review mode
-	tabSearching bool
-	tabSearch    string
-	tabMatches   []int // indices of matching tabs during search
+	tabs       []FileTab
+	activeTab  int
+	multiFile  bool // true when in code review mode
+	fileSelect fileSelectState
 
 	// Single-file mode (legacy)
 	filePath string
 
-	detached bool
+	// Review session backing all tabs, and the author stamped on new comments.
+	session          *review.Session
+	author           string
+	authorColors     map[string]int
+	threadScrolls    map[threadViewKey]threadScroll
+	hideComments     bool
+	foldResolved     bool
+	ignoreWhitespace bool
+	previousReplyIDs []string // submission baseline pending initial window dimensions
+	initialFocus     *sourceLocation
 
-	contentViewport viewport.Model
-	commentViewport viewport.Model
-	modalTextarea   textarea.Model
+	// Finish-flow state (see AppConfig).
+	finishCh chan<- FinishEvent
+	baseRef  string
+	staged   bool
+	patch    *gitpkg.Patch
+	source   *gitpkg.ReviewSource
+
+	host string // multiplexer hosting an agent-launched review, if any
+
+	contentViewport   viewport.Model
+	commentViewport   viewport.Model
+	sidebarView       sidebarView
+	fileTree          fileTree
+	modalTextarea     textarea.Model
+	clipboardID       uint64
+	clipboardPending  bool
+	clipboardStatus   string
+	killRing          killRing
+	completion        completionState
+	mouseSelecting    bool
+	hoveredGutterLine int
+	hoveredGutterSide string
+	contentLayout     renderedContentLayout
+	sidebarTargets    []int
+	sidebarActions    []commentHeaderRegion
 
 	// Editing state
-	editingID  string // ID of the comment being edited
-	modalFocus int    // 0=textarea, 1=save button, 2=cancel button, 3=delete button (edit modal only)
+	editingID            string // ID of the parent comment being edited or replied to
+	editingReplyID       string // ID of the reply being edited; empty when editing the parent
+	modalInitial         string // textarea value when the current text modal opened
+	modalOpenedAt        time.Time
+	modalOpeningClick    tea.Mouse
+	modalReferenceOffset int
+	helpOffset           int
+	discardReturn        modalType
+	deleteReturn         modalType
+	pendingDelete        int
+	modalFocus           int  // focus index within the active modal
+	newFeedback          bool // true after adding or editing a comment in this round
+	finishSaveFailed     bool
+	finishDraft          string
+	finishVerdict        review.Verdict
+	lineInput            textinput.Model
+	pendingLocation      sourceLocation
+	locationError        string
+	isearch              isearchState
 
 	err error
+}
+
+type renderedRange struct {
+	start int
+	end   int
+}
+
+type mouseRect struct {
+	left   int
+	top    int
+	right  int
+	bottom int
+}
+
+func (r mouseRect) contains(mouse tea.Mouse) bool {
+	return mouse.X >= r.left && mouse.X < r.right && mouse.Y >= r.top && mouse.Y < r.bottom
+}
+
+type renderedContentLayout struct {
+	formControls []formControl
+	rows         []contentMouseTarget
+	lineRanges   map[int]renderedRange
+	oldRanges    map[int]renderedRange
+	actions      []commentHeaderRegion
+	markers      []commentMarker
+}
+
+type commentHeaderRegion struct {
+	resolve mouseRect
+	up      mouseRect
+	down    mouseRect
+	delete  mouseRect
+	id      string
+}
+
+func (r *commentHeaderRegion) translate(x, y int) {
+	for _, rect := range []*mouseRect{&r.resolve, &r.up, &r.down, &r.delete} {
+		rect.left += x
+		rect.right += x
+		rect.top += y
+		rect.bottom += y
+	}
+}
+
+type renderedScreenLayout struct {
+	finishButton    mouseRect
+	hasFinishButton bool
+	footerHelp      mouseRect
+	hasFooterHelp   bool
+	imagesButton    mouseRect
+	hasImagesButton bool
+	modalRegions    []modalMouseRegion
+	isearchCursor   *tea.Cursor
+	isearchRegions  []isearchMouseRegion
+	progressRegions []progressRegion
+}
+
+func newRenderedContentLayout() renderedContentLayout {
+	return renderedContentLayout{
+		lineRanges: make(map[int]renderedRange),
+		oldRanges:  make(map[int]renderedRange),
+	}
+}
+
+func (l *renderedContentLayout) appendBlock(b *strings.Builder, block string, target contentMouseTarget) {
+	block = strings.TrimSuffix(block, "\n")
+	start := len(l.rows)
+	for _, row := range strings.Split(block, "\n") {
+		b.WriteString(row)
+		b.WriteByte('\n')
+		l.rows = append(l.rows, target)
+	}
+	if target.line <= 0 && !target.annotation {
+		return
+	}
+	ranges := l.lineRanges
+	if target.side == "old" {
+		ranges = l.oldRanges
+	}
+	r, ok := ranges[target.line]
+	if !ok {
+		r.start = start
+	}
+	r.end = len(l.rows)
+	ranges[target.line] = r
 }
 
 // tab returns the active FileTab. Panics if no tabs exist.
@@ -73,51 +260,70 @@ func (m *AppModel) tab() *FileTab {
 	return &m.tabs[m.activeTab]
 }
 
-func NewApp(filePath string) AppModel {
+func NewApp(filePath string, cfg AppConfig) AppModel {
 	ta := textarea.New()
+	ta.SetVirtualCursor(false)
 	ta.Placeholder = "Type your comment..."
 	ta.ShowLineNumbers = false
-	ta.CharLimit = 2000
 
 	tab := FileTab{
 		path:       filePath,
 		cursorLine: 1,
+		isBinary:   imagePath(filePath),
 	}
 
-	return AppModel{
+	m := AppModel{
+		images:          newImageDisplay(),
+		project:         cfg.Project,
+		topic:           cfg.Topic,
+		version:         cfg.Version,
 		filePath:        filePath,
 		tabs:            []FileTab{tab},
 		activeTab:       0,
-		detached:        os.Getenv("CRIT_DETACHED") == "1",
+		session:         cfg.Session,
+		author:          cfg.Author,
+		authorColors:    make(map[string]int),
+		finishCh:        cfg.FinishCh,
+		host:            reviewHost(),
+		initialFocus:    startupLocation(cfg),
 		contentViewport: viewport.New(),
 		commentViewport: viewport.New(),
+		fileTree:        newFileTree(),
 		modalTextarea:   ta,
 	}
+	m.addDocuments(cfg.Documents)
+	m.ensureOverallCommentsTab()
+	m.orderTabsByTree()
+	return m
 }
 
 // NewCodeReviewApp creates a multi-file code review TUI.
-func NewCodeReviewApp(files []gitpkg.FileChange, ref string) AppModel {
+func NewCodeReviewApp(files []gitpkg.FileChange, ref string, cfg AppConfig) AppModel {
 	ta := textarea.New()
+	ta.SetVirtualCursor(false)
 	ta.Placeholder = "Type your comment..."
 	ta.ShowLineNumbers = false
-	ta.CharLimit = 2000
 
-	// Sort files alphabetically by path
-	sortedFiles := make([]gitpkg.FileChange, len(files))
-	copy(sortedFiles, files)
-	sort.Slice(sortedFiles, func(i, j int) bool {
-		return sortedFiles[i].Path < sortedFiles[j].Path
-	})
-
-	tabs := make([]FileTab, 0, len(sortedFiles))
-	for _, f := range sortedFiles {
+	tabs := make([]FileTab, 0, len(files))
+	for _, f := range files {
 		var diff *gitpkg.DiffInfo
-		if f.Status != gitpkg.StatusDeleted && f.Status != gitpkg.StatusBinary {
-			diff, _ = gitpkg.DiffFile(f.Path, ref)
+		if cfg.Patch != nil {
+			if pf := cfg.Patch.File(f.Path); pf != nil {
+				diff = pf.Diff
+			}
+		} else if !f.IsBinary() {
+			if cfg.Source != nil {
+				diff, _ = cfg.Source.Diff(f.Path, f.OldPath)
+			} else {
+				diff, _ = codeDiff(f.Path, f.OldPath, ref, cfg.Staged)
+			}
 		}
 		ft := newFileTab(f.Path, diff)
+		ft.oldPath = f.OldPath
+		ft.status = f.Status.String()
+		ft.isBinary = f.IsBinary() || cfg.Patch == nil && imagePath(f.Path)
 		if f.Status == gitpkg.StatusBinary {
-			ft.isBinary = true
+			ft.status = "modified"
 		}
 		if f.Status == gitpkg.StatusDeleted {
 			ft.isDeleted = true
@@ -125,15 +331,73 @@ func NewCodeReviewApp(files []gitpkg.FileChange, ref string) AppModel {
 		tabs = append(tabs, ft)
 	}
 
-	return AppModel{
+	if cfg.Session != nil {
+		present := make(map[string]bool, len(tabs))
+		for _, tab := range tabs {
+			present[tab.path] = true
+		}
+		for _, doc := range cfg.Documents {
+			present[doc.Path()] = true
+		}
+		for path, file := range cfg.Session.CJ.Files {
+			if !present[path] && len(file.Comments) > 0 {
+				tab := newFileTab(path, nil)
+				tab.outsideChanges = true
+				tabs = append(tabs, tab)
+			}
+		}
+	}
+
+	m := AppModel{
+		images:          newImageDisplay(),
+		project:         cfg.Project,
+		topic:           cfg.Topic,
+		version:         cfg.Version,
 		tabs:            tabs,
 		activeTab:       0,
 		multiFile:       true,
-		detached:        os.Getenv("CRIT_DETACHED") == "1",
+		session:         cfg.Session,
+		author:          cfg.Author,
+		authorColors:    make(map[string]int),
+		finishCh:        cfg.FinishCh,
+		baseRef:         ref,
+		staged:          cfg.Staged,
+		patch:           cfg.Patch,
+		source:          cfg.Source,
+		host:            reviewHost(),
+		initialFocus:    startupLocation(cfg),
 		contentViewport: viewport.New(),
 		commentViewport: viewport.New(),
+		fileTree:        newFileTree(),
 		modalTextarea:   ta,
 	}
+	m.addDocuments(cfg.Documents)
+	m.ensureOverallCommentsTab()
+	m.orderTabsByTree()
+	return m
+}
+
+func (m *AppModel) addDocuments(docs []review.AttachedDocument) {
+	var active, removed []FileTab
+	m.attachments = make(map[string]review.AttachedDocument, len(docs))
+	for _, d := range docs {
+		if d.Removed && (m.session == nil || len(m.session.FileComments(d.Path())) == 0) {
+			continue
+		}
+		tab := newFileTab(d.Path(), nil)
+		m.attachments[d.Path()] = d
+		tab.attachment = &d
+		if d.Removed {
+			removed = append(removed, tab)
+		} else {
+			active = append(active, tab)
+		}
+	}
+	if len(active)+len(removed) == 0 {
+		return
+	}
+	m.tabs = append(append(active, m.tabs...), removed...)
+	m.multiFile = true
 }
 
 func (m AppModel) Init() tea.Cmd {
@@ -143,10 +407,10 @@ func (m AppModel) Init() tea.Cmd {
 func (m AppModel) loadDocuments() tea.Cmd {
 	return func() tea.Msg {
 		for _, tab := range m.tabs {
-			if tab.isBinary || tab.isDeleted {
+			if tab.isBinary || tab.isDeleted || tab.outsideChanges {
 				continue
 			}
-			if _, err := document.Load(tab.path); err != nil {
+			if _, err := m.loadDocument(tab.path); err != nil {
 				return errMsg{err}
 			}
 		}
@@ -154,73 +418,321 @@ func (m AppModel) loadDocuments() tea.Cmd {
 	}
 }
 
-// selectionRange returns the ordered start/end of the current selection.
-// If not selecting, returns cursorLine, cursorLine.
-func (m *AppModel) selectionRange() (int, int) {
-	t := m.tab()
-	if !t.selecting {
-		return t.cursorLine, t.cursorLine
+func (m AppModel) loadDocument(path string) (*document.Document, error) {
+	if path == overallCommentsPath {
+		return overallCommentsDocument(), nil
 	}
-	start, end := t.selectAnchor, t.cursorLine
-	if start > end {
-		start, end = end, start
+	if d, ok := m.attachments[path]; ok {
+		return document.FromContent(path, []byte(d.Content)), nil
 	}
-	return start, end
+	if m.source != nil {
+		content, err := m.source.Content(path)
+		if err != nil {
+			return nil, err
+		}
+		return document.FromContent(path, content), nil
+	}
+	if m.patch != nil {
+		if f := m.patch.File(path); f != nil {
+			doc := document.FromContent(path, []byte(f.Content))
+			doc.Known = f.Known
+			return doc, nil
+		}
+		return nil, fmt.Errorf("file absent from diff: %s", path)
+	}
+	if !m.staged {
+		return document.Load(path)
+	}
+	content, err := gitpkg.FileContentFromIndex(path)
+	if err != nil {
+		return nil, err
+	}
+	return document.FromContent(path, content), nil
+}
+
+func codeDiff(path, oldPath, ref string, staged bool) (*gitpkg.DiffInfo, error) {
+	if staged {
+		return gitpkg.DiffFileStaged(path, oldPath)
+	}
+	return gitpkg.DiffFile(path, oldPath, ref)
 }
 
 func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	emptyBefore := m.modal == finishModal && m.modalFocus == finishText && m.modalTextarea.Value() == ""
+	previousHeaderHeight := m.headerHeight()
+	model, cmd := m.update(msg)
+	switch app := model.(type) {
+	case AppModel:
+		app.updateFinishVerdictOnInput(emptyBefore)
+		app.refreshCompletion()
+		app.refreshHeaderLayout(previousHeaderHeight)
+		app.markVisibleForms()
+		return app, tea.Batch(cmd, app.recheckImagesOnSelection(m.activeTab, msg), app.prepareImage(),
+			app.scheduleEditorImages(), app.prepareCommentImages(), app.prepareLightbox())
+	case *AppModel:
+		app.updateFinishVerdictOnInput(emptyBefore)
+		app.refreshCompletion()
+		app.refreshHeaderLayout(previousHeaderHeight)
+		app.markVisibleForms()
+		return app, tea.Batch(cmd, app.recheckImagesOnSelection(m.activeTab, msg), app.prepareImage(),
+			app.scheduleEditorImages(), app.prepareCommentImages(), app.prepareLightbox())
+	}
+	return model, cmd
+}
+
+func (m *AppModel) refreshHeaderLayout(previousHeight int) {
+	if len(m.tabs) > 0 && m.width > 0 && m.headerHeight() != previousHeight {
+		m.recalculateLayout()
+		m.rebuildContent()
+		m.scrollToCursor()
+	}
+}
+
+func (m AppModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	msg, cmd := m.images.decodeResponse(msg)
+	if msg == nil {
+		return m, cmd
+	}
+	if replay, ok := msg.(imageResponseReplayMsg); ok {
+		var commands []tea.Cmd
+		for _, key := range replay.keys {
+			model, cmd := m.updateMessage(key)
+			switch app := model.(type) {
+			case AppModel:
+				m = app
+			case *AppModel:
+				m = *app
+			}
+			commands = append(commands, cmd)
+		}
+		return m, tea.Batch(commands...)
+	}
+	return m.updateMessage(msg)
+}
+
+func (m AppModel) updateMessage(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.clipboardPending {
+		switch input := msg.(type) {
+		case tea.KeyPressMsg:
+			if input.String() == "esc" || input.String() == "ctrl+c" {
+				m.clipboardPending = false
+				m.clipboardStatus = ""
+			}
+			return m, nil
+		case tea.PasteMsg, tea.MouseClickMsg, tea.MouseMotionMsg, tea.MouseReleaseMsg, tea.MouseWheelMsg:
+			return m, nil
+		}
+	}
 	switch msg := msg.(type) {
-	case tea.BackgroundColorMsg:
-		initAdaptiveStyles(msg.IsDark())
+	case uv.KittyGraphicsEvent, tea.CursorPositionMsg, imageProbeMsg, imageProbeTimeoutMsg:
+		return m.updateImageCapability(msg)
+	case imageProbeSkippedMsg:
+		// The pane may be selected moments later, as a launcher focuses it
+		// after creation, so the pending timeout retries like an unanswered
+		// query instead of ending the check.
+		if msg.id == m.images.probeID {
+			m.images.skipped = true
+		}
+		return m, nil
+	case imageLoadedMsg:
+		return m.finishImageLoad(msg)
+	case imageTransmittedMsg:
+		if msg.comment != nil {
+			if side := m.commentImages[*msg.comment]; side != nil {
+				side.image = &inlineImage{id: msg.id, width: msg.width, height: msg.height}
+			}
+			return m, nil
+		}
+		for i := range m.tabs {
+			if m.tabs[i].path == msg.path {
+				m.tabs[i].imageSide(msg.before, msg.markdown).image = &inlineImage{id: msg.id, width: msg.width, height: msg.height}
+			}
+		}
+		return m, nil
+	case imageReadyMsg:
+		if msg.comment != nil {
+			if side := m.commentImages[*msg.comment]; side != nil && side.image != nil {
+				side.image.ready = side.image.columns == msg.columns && side.image.rows == msg.rows
+			}
+			m.rebuildContent()
+			m.updateCommentSidebar()
+			return m, nil
+		}
+		for i := range m.tabs {
+			if m.tabs[i].path != msg.path {
+				continue
+			}
+			img := m.tabs[i].imageSide(msg.before, msg.markdown).image
+			if img != nil && img.columns == msg.columns && img.rows == msg.rows {
+				img.ready = true
+			}
+		}
 		if len(m.tabs) > 0 && m.tab().state != nil {
 			m.rebuildContent()
+		}
+		return m, nil
+	case markdownImagesMsg:
+		for i := range m.tabs {
+			if m.tabs[i].path == msg.path {
+				m.tabs[i].markdownImages = msg.images
+			}
+		}
+		return m, nil
+	case lightboxReadyMsg:
+		m.finishLightboxPlacement(msg)
+		return m, nil
+	case lightboxLoadedMsg:
+		return m, m.finishLightboxLoad(msg)
+	case editorImagesMsg:
+		m.finishEditorImagesDelay(msg)
+		return m, nil
+	case externalOpenMsg:
+		m.locationError = msg.status
+		return m, nil
+	case tea.BackgroundColorMsg:
+		recolor := msg.IsDark() != terminalIsDark
+		initAdaptiveStyles(msg.IsDark())
+		for i := range m.tabs {
+			if recolor && m.tabs[i].chromaLines != nil {
+				m.tabs[i].chromaLines, m.tabs[i].deletedLineCache = nil, nil
+				m.tabs[i].ensureHighlightCache()
+			}
+		}
+		m.modalTextarea.SetStyles(textarea.DefaultStyles(msg.IsDark()))
+		if len(m.tabs) > 0 && m.tab().state != nil {
+			m.rebuildContent()
+			m.updateCommentSidebar()
 		}
 		return m, nil
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.images.cell = cellPixelSize()
 		m.recalculateLayout()
 		if len(m.tabs) > 0 && m.tab().state != nil {
 			m.rebuildContent()
+			m.updateCommentSidebar()
+			m.focusStartupLocation()
+			m.focusNewReply()
 		}
 		return m, nil
 
 	case docRenderedMsg:
-		// Load documents and initialize fresh review state for each tab
+		if err := m.restoreRound(); err != nil {
+			m.err = err
+			return m, nil
+		}
+		// Load documents and existing review comments for each tab
 		for i := range m.tabs {
 			t := &m.tabs[i]
-			if t.isBinary || t.isDeleted {
-				t.state = &review.ReviewState{
-					File:     t.path,
-					Comments: []review.Comment{},
+			t.state = &fileReview{Comments: m.sessionComments(t.path)}
+			if t.isBinary {
+				continue
+			}
+			if t.outsideChanges {
+				continue
+			}
+			if t.isDeleted {
+				t.doc = &document.Document{Path: t.path}
+				t.ensureHighlightCache()
+				if lines := m.visualLines(t); len(lines) > 0 {
+					t.cursorLine, t.cursorSide = lines[0].line, lines[0].side
 				}
 				continue
 			}
-			doc, _ := document.Load(t.path)
+			doc, _ := m.loadDocument(t.path)
 			t.doc = doc
-			t.state = &review.ReviewState{
-				File:     t.path,
-				Comments: []review.Comment{},
-			}
 			t.ensureHighlightCache()
+			if m.patch != nil {
+				if lines := m.visualLines(t); len(lines) > 0 {
+					t.cursorLine, t.cursorSide = lines[0].line, lines[0].side
+				}
+			}
 		}
 
+		m.recalculateLayout()
 		m.rebuildContent()
 		m.updateCommentSidebar()
+		m.focusStartupLocation()
+		m.focusNewReply()
+		return m, nil
+
+	case sourceEditorReadyMsg:
+		if msg.err != nil {
+			m.locationError = msg.err.Error()
+			return m, nil
+		}
+		return m, tea.ExecProcess(msg.cmd, func(err error) tea.Msg { return sourceEditorFinishedMsg{err: err} })
+
+	case sourceEditorFinishedMsg:
+		if msg.err != nil {
+			m.locationError = fmt.Sprintf("running $EDITOR: %v", msg.err)
+		}
+		return m, nil
+
+	case clipboardImageMsg:
+		cmd := m.finishClipboardImage(msg)
+		return m, cmd
+
+	case editorFinishedMsg:
+		m.killRing.interrupt()
+		m.finishExternalEdit(msg)
 		return m, nil
 
 	case errMsg:
 		m.err = msg.err
 		return m, nil
 
+	case tea.MouseClickMsg:
+		m.killRing.interrupt()
+		if m.handleISearchMouse(msg.Mouse()) {
+			return m, nil
+		}
+		if m.isearch.active && m.modal == noModal && msg.Mouse().Button == tea.MouseLeft {
+			m.exitISearch(false)
+		}
+		return m.handleMouseClick(msg)
+	case tea.MouseMotionMsg:
+		m.killRing.interrupt()
+		return m.handleMouseMotion(msg)
+	case tea.MouseReleaseMsg:
+		m.killRing.interrupt()
+		return m.handleMouseRelease(msg)
+	case tea.MouseWheelMsg:
+		m.killRing.interrupt()
+		return m.handleMouseWheel(msg)
+
 	case tea.KeyPressMsg:
+		kill, _ := killDirection(msg, m.modalTextarea.KeyMap)
+		if !m.isTextModal() || m.modalFocus != 0 || (!kill && msg.String() != "ctrl+y" && msg.String() != "alt+y" && msg.String() != "alt+w") {
+			m.killRing.interrupt()
+		}
 		return m.handleKeyPress(msg)
+	case tea.PasteMsg:
+		if m.isearch.active && m.modal == noModal {
+			m.killRing.interrupt()
+			m.isearchPaste(msg.Content)
+			return m, nil
+		}
 	}
 
 	var cmd tea.Cmd
-	if m.modal != noModal {
+	if m.modal == gotoLineModal {
+		m.lineInput, cmd = m.lineInput.Update(msg)
+		return m, cmd
+	}
+	if m.modal == fileSelectModal {
+		m.fileSelect.input, cmd = m.fileSelect.input.Update(msg)
+		m.refreshFileSelect()
+		return m, cmd
+	}
+	if m.isTextModal() && m.modalFocus == 0 {
+		before := m.modalTextarea.Value()
 		m.modalTextarea, cmd = m.modalTextarea.Update(msg)
+		if _, pasted := msg.(tea.PasteMsg); pasted || m.modalTextarea.Value() != before {
+			m.killRing.interrupt()
+		}
 		return m, cmd
 	}
 
@@ -228,33 +740,148 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case contentPane:
 		m.contentViewport, cmd = m.contentViewport.Update(msg)
 	case commentPane:
-		m.commentViewport, cmd = m.commentViewport.Update(msg)
+		if m.sidebarView == filesView {
+			m.fileTree.viewport, cmd = m.fileTree.viewport.Update(msg)
+		} else {
+			m.commentViewport, cmd = m.commentViewport.Update(msg)
+		}
 	}
 
 	return m, cmd
 }
 
 func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	if m.modal == commentModal || m.modal == editModal {
+	if m.err != nil {
+		if m.finishSaveFailed && (msg.String() == "enter" || msg.String() == "y") {
+			return m.doFinish()
+		}
+		if msg.String() == "q" || msg.String() == "ctrl+c" {
+			return m, tea.Quit
+		}
+		if m.finishSaveFailed && msg.String() == "esc" {
+			m.err, m.finishSaveFailed, m.modal = nil, false, noModal
+		}
+		return m, nil
+	}
+	if m.modal == gotoLineModal || m.modal == openSourceModal {
+		return m.handleLocationModal(msg)
+	}
+	if m.modal == fileSelectModal {
+		return m.handleFileSelectModal(msg)
+	}
+	m.locationError = ""
+	if m.modal == lightboxModal {
+		return m.handleLightboxKey(msg)
+	}
+	if m.hoveredGutterLine != 0 {
+		m.hoveredGutterLine = 0
+		m.hoveredGutterSide = ""
+		m.rebuildContent()
+	}
+	if m.modal == helpModal {
+		if key.Matches(msg, keys.Help) || key.Matches(msg, keys.Cancel) {
+			m.modal = noModal
+		} else {
+			switch msg.String() {
+			case "up", "k":
+				m.scrollHelp(-1)
+			case "down", "j":
+				m.scrollHelp(1)
+			case "pgup", "ctrl+u":
+				m.scrollHelp(-max(1, m.height/2))
+			case "pgdown", "ctrl+d":
+				m.scrollHelp(max(1, m.height/2))
+			case "home", "g":
+				m.helpOffset = 0
+			case "end", "G":
+				m.scrollHelp(len(strings.Split(m.renderHelp(m.modalInnerWidth()), "\n")))
+			}
+		}
+		return m, nil
+	}
+	if m.modal == discardChangesModal {
+		return m.handleDiscardChangesModal(msg)
+	}
+	if m.modal == deleteConfirmModal {
+		return m.handleDeleteConfirmModal(msg)
+	}
+	if m.modal == commentModal || m.modal == fileCommentModal || m.modal == replyModal || m.modal == editModal {
 		return m.handleTextModal(msg)
 	}
+	if m.modal == finishModal {
+		return m.handleFinishModal(msg)
+	}
+	if m.modal == finishResolveModal || m.modal == finishAbortModal {
+		return m.handleFinishConfirmationKey(msg)
+	}
+	if m.modal == finishFormsModal {
+		return m.handleFinishFormsKey(msg)
+	}
 
-	// Tab search input mode
-	if m.tabSearching {
-		return m.handleTabSearch(msg)
+	if len(m.tabs) == 0 {
+		if key.Matches(msg, keys.Quit) {
+			m.openFinishModal()
+		}
+		return m, nil
 	}
 
 	t := m.tab()
+	if m.isearch.active && m.handleISearchKey(msg) {
+		return m, nil
+	}
+	switch msg.String() {
+	case "ctrl+s", "/", "ctrl+r", "?":
+		if t.doc != nil {
+			m.startISearch(msg.String() == "ctrl+s" || msg.String() == "/")
+			return m, nil
+		}
+	}
+	if msg.String() == "space" || msg.String() == " " {
+		if m.focused == contentPane && !t.selecting && !t.cursorOnAnnotation && t.cursorSide == "" && m.toggleForm(t.cursorLine) {
+			return m, nil
+		}
+	}
+	if msg.String() == "alt+e" {
+		m.locationError = ""
+		return m, m.openSourceEditor(sourceLocation{path: t.path, line: max(1, t.cursorLine)})
+	}
+	if msg.String() == "alt+g" {
+		return m, m.openGotoLine()
+	}
+	if msg.String() == "alt+w" {
+		m.copyReference()
+		return m, nil
+	}
+	if msg.String() == "alt+o" && !t.selecting {
+		return m, m.openReferenceAtCursor()
+	}
+	if msg.String() == "alt+p" && m.multiFile {
+		return m, m.openFileSelect()
+	}
+	if key.Matches(msg, keys.FileTree) && !t.selecting {
+		m.toggleSidebarView()
+		return m, nil
+	}
+	if m.focused == commentPane && m.sidebarView == filesView && !t.selecting && m.handleFileTreeKey(msg) {
+		return m, nil
+	}
+
+	if msg.String() == "ctrl+pgup" || msg.String() == "ctrl+pgdown" {
+		direction := 1
+		if msg.String() == "ctrl+pgup" {
+			direction = -1
+		}
+		if id := m.selectedCommentID(); id != "" {
+			m.scrollThread(threadViewKey{id: id, sidebar: m.focused == commentPane}, direction, true)
+		}
+		return m, nil
+	}
 
 	switch {
 	case key.Matches(msg, keys.Quit):
-		// Auto-save all tabs on quit
-		for i := range m.tabs {
-			if m.tabs[i].state != nil {
-				review.Save(m.tabs[i].state)
-			}
-		}
-		return m, tea.Quit
+		// Finishing is an explicit act: q opens the Approve/Finish modal.
+		m.openFinishModal()
+		return m, nil
 
 	case key.Matches(msg, keys.Cancel):
 		// Esc cancels selection
@@ -265,8 +892,68 @@ func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case key.Matches(msg, keys.Help):
+		m.helpOffset = 0
+		m.modal = helpModal
+		return m, nil
+
+	case key.Matches(msg, keys.IgnoreWhitespace):
+		if m.multiFile {
+			m.toggleWhitespace()
+		}
+		return m, nil
+	case key.Matches(msg, keys.Images):
+		cmd := m.toggleImages()
+		return m, cmd
+
+	case key.Matches(msg, keys.FoldResolved):
+		m.foldResolved = !m.foldResolved
+		m.hideComments = false
+		m.recalculateLayout()
+		m.updateCommentSidebar()
+		m.rebuildContent()
+		return m, nil
+
+	case key.Matches(msg, keys.HideComments):
+		selectedID := ""
+		if t.sidebarCursor < len(t.sidebarItems) {
+			selectedID = t.sidebarItems[t.sidebarCursor].id
+		}
+		m.hideComments = !m.hideComments
+		m.foldResolved = false
+		if m.hideComments {
+			for i := range m.tabs {
+				clear(m.tabs[i].expandedDrifted)
+			}
+		}
+		m.focused = contentPane
+		t.cursorOnAnnotation = false
+		if t.cursorLine == 0 {
+			m.moveCursorBy(t, 1, 1)
+		}
+		m.recalculateLayout()
+		m.updateCommentSidebar()
+		for i, item := range t.sidebarItems {
+			if item.id == selectedID {
+				t.sidebarCursor = i
+				break
+			}
+		}
+		m.updateCommentSidebar()
+		m.rebuildContent()
+		if m.focused == commentPane {
+			m.scrollToSidebarCursor()
+		} else {
+			m.scrollToCursor()
+		}
+		return m, nil
+
 	case key.Matches(msg, keys.Tab):
 		if !t.selecting {
+			if m.hideComments {
+				m.hideComments = false
+				m.recalculateLayout()
+			}
 			if m.focused == contentPane {
 				m.focused = commentPane
 			} else {
@@ -278,20 +965,54 @@ func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, keys.VisualMode):
-		if m.focused == contentPane && t.doc != nil {
+		if m.focused == contentPane && t.doc != nil && t.cursorLine > 0 {
 			if t.selecting {
 				t.selecting = false
 			} else {
 				t.selecting = true
 				t.selectAnchor = t.cursorLine
+				t.selectSide = t.cursorSide
+				t.cursorOnAnnotation = false
+				t.cursorAnnoIdx = 0
 			}
 			m.rebuildContent()
 			return m, nil
 		}
+
+	case key.Matches(msg, keys.FileComment):
+		if !t.selecting && t.state != nil {
+			for _, c := range t.state.Comments {
+				if isGeneralCommentScope(c.Scope) {
+					m.editingID = c.ID
+					m.editingReplyID = ""
+					m.modalReferenceOffset = -1
+					m.modal = replyModal
+					m.modalFocus = 0
+					m.modalTextarea.Placeholder = "Write a reply..."
+					m.modalTextarea.Reset()
+					m.modalInitial = ""
+					m.modalTextarea.Focus()
+					return m, nil
+				}
+			}
+			m.modal = fileCommentModal
+			m.modalFocus = 0
+			m.modalTextarea.Placeholder = "Type your file comment..."
+			m.modalTextarea.Reset()
+			m.modalInitial = ""
+			m.modalTextarea.Focus()
+		}
+		return m, nil
+
+	case key.Matches(msg, keys.Delete):
+		if !t.selecting {
+			m.openSelectedCommentDelete()
+		}
+		return m, nil
 	}
 
 	// Tab switching (multi-file mode)
-	if m.multiFile && m.focused == contentPane && !t.selecting {
+	if m.multiFile && !t.selecting {
 		switch {
 		case key.Matches(msg, keys.PrevTab):
 			if m.activeTab > 0 {
@@ -307,12 +1028,10 @@ func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.updateCommentSidebar()
 			}
 			return m, nil
-		case key.Matches(msg, keys.TabSearch):
-			m.tabSearching = true
-			m.tabSearch = ""
-			m.tabMatches = nil
-			return m, nil
 		}
+	}
+
+	if m.multiFile && m.focused == contentPane && !t.selecting {
 		// Number keys 1-9 for direct tab access
 		if s := msg.String(); len(s) == 1 && s[0] >= '1' && s[0] <= '9' {
 			idx := int(s[0]-'0') - 1
@@ -325,29 +1044,73 @@ func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	if !t.selecting {
+		switch {
+		case key.Matches(msg, keys.NextChange):
+			m.jumpToChange(1)
+			return m, nil
+		case key.Matches(msg, keys.PrevChange):
+			m.jumpToChange(-1)
+			return m, nil
+		}
+	}
+
+	if m.focused == contentPane && !t.selecting {
+		switch {
+		case key.Matches(msg, keys.NextUnresolved):
+			m.jumpToCommentOrFinish(1, false)
+			return m, nil
+		case key.Matches(msg, keys.PrevUnresolved):
+			m.jumpToCommentOrFinish(-1, false)
+			return m, nil
+		case key.Matches(msg, keys.NextComment):
+			m.jumpToCommentOrFinish(1, true)
+			return m, nil
+		case key.Matches(msg, keys.PrevComment):
+			m.jumpToCommentOrFinish(-1, true)
+			return m, nil
+		}
+	}
+
+	if id := m.selectedCommentID(); id != "" {
+		if _, drifted := m.driftedComment(id); drifted {
+			if key.Matches(msg, keys.Confirm) {
+				m.toggleDrifted(id)
+				return m, nil
+			}
+			if msg.String() == "e" {
+				m.openCommentThread(id)
+				return m, nil
+			}
+		}
+	}
+
 	// Content pane cursor movement (annotation-aware)
-	if m.focused == contentPane && t.doc != nil {
+	if m.focused == contentPane && (t.doc != nil || t.cursorOnAnnotation) {
 		moved := false
+		if m.hideComments && key.Matches(msg, keys.Up, keys.Down) {
+			t.cursorOnAnnotation = false
+		}
 		switch {
 		case key.Matches(msg, keys.Down):
 			if t.cursorOnAnnotation {
-				anns := m.annotationsAfterLine(t.cursorLine)
+				anns := m.annotationsAfterLine(t.cursorLine, t.cursorSide)
 				if t.cursorAnnoIdx < len(anns)-1 {
 					t.cursorAnnoIdx++
 				} else {
 					t.cursorOnAnnotation = false
 					t.cursorAnnoIdx = 0
-					if t.cursorLine < t.doc.LineCount() {
-						t.cursorLine++
+					if next, ok := m.adjacentLine(t, 1); ok && (!t.selecting || next.side == t.selectSide) {
+						t.cursorLine, t.cursorSide = next.line, next.side
 					}
 				}
 			} else {
-				anns := m.annotationsAfterLine(t.cursorLine)
-				if len(anns) > 0 {
+				anns := m.annotationsAfterLine(t.cursorLine, t.cursorSide)
+				if len(anns) > 0 && !t.selecting && !m.hideComments {
 					t.cursorOnAnnotation = true
 					t.cursorAnnoIdx = 0
-				} else if t.cursorLine < t.doc.LineCount() {
-					t.cursorLine++
+				} else if next, ok := m.adjacentLine(t, 1); ok && (!t.selecting || next.side == t.selectSide) {
+					t.cursorLine, t.cursorSide = next.line, next.side
 				}
 			}
 			moved = true
@@ -355,20 +1118,24 @@ func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			if t.cursorOnAnnotation {
 				if t.cursorAnnoIdx > 0 {
 					t.cursorAnnoIdx--
-				} else {
+				} else if t.cursorLine != 0 {
 					t.cursorOnAnnotation = false
 					t.cursorAnnoIdx = 0
 				}
 			} else {
-				prevLine := t.cursorLine - 1
-				if prevLine >= 1 {
-					anns := m.annotationsAfterLine(prevLine)
-					if len(anns) > 0 {
-						t.cursorLine = prevLine
+				if prev, ok := m.adjacentLine(t, -1); ok && (!t.selecting || prev.side == t.selectSide) {
+					anns := m.annotationsAfterLine(prev.line, prev.side)
+					if len(anns) > 0 && !t.selecting && !m.hideComments {
+						t.cursorLine, t.cursorSide = prev.line, prev.side
 						t.cursorOnAnnotation = true
 						t.cursorAnnoIdx = len(anns) - 1
 					} else {
-						t.cursorLine = prevLine
+						t.cursorLine, t.cursorSide = prev.line, prev.side
+					}
+				} else if !t.selecting && !m.hideComments {
+					if anns := m.annotationsAfterLine(0, ""); len(anns) > 0 {
+						t.cursorLine, t.cursorSide = 0, ""
+						t.cursorOnAnnotation, t.cursorAnnoIdx = true, len(anns)-1
 					}
 				}
 			}
@@ -377,175 +1144,84 @@ func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			t.cursorOnAnnotation = false
 			t.cursorAnnoIdx = 0
 			jump := m.contentViewport.Height() / 2
-			t.cursorLine += jump
-			if t.cursorLine > t.doc.LineCount() {
-				t.cursorLine = t.doc.LineCount()
-			}
+			m.moveCursorBy(t, 1, jump)
 			moved = true
 		case key.Matches(msg, keys.HalfPageUp):
 			t.cursorOnAnnotation = false
 			t.cursorAnnoIdx = 0
 			jump := m.contentViewport.Height() / 2
-			t.cursorLine -= jump
-			if t.cursorLine < 1 {
-				t.cursorLine = 1
-			}
+			m.moveCursorBy(t, -1, jump)
 			moved = true
 		case key.Matches(msg, keys.Top):
 			t.cursorOnAnnotation = false
 			t.cursorAnnoIdx = 0
-			t.cursorLine = 1
+			if lines := m.visualLines(t); len(lines) > 0 && (!t.selecting || lines[0].side == t.selectSide) {
+				t.cursorLine, t.cursorSide = lines[0].line, lines[0].side
+			}
 			moved = true
 		case key.Matches(msg, keys.Bottom):
 			t.cursorOnAnnotation = false
 			t.cursorAnnoIdx = 0
-			t.cursorLine = t.doc.LineCount()
+			if lines := m.visualLines(t); len(lines) > 0 && (!t.selecting || lines[len(lines)-1].side == t.selectSide) {
+				last := lines[len(lines)-1]
+				t.cursorLine, t.cursorSide = last.line, last.side
+			}
 			moved = true
-		case key.Matches(msg, keys.NextComment):
-			if t.state != nil && len(t.state.Comments) > 0 {
-				type target struct {
-					endLine int
-					idx     int
-				}
-				var best *target
-				for _, c := range t.state.Comments {
-					endAt := c.Line
-					if c.EndLine > 0 {
-						endAt = c.EndLine
-					}
-					if endAt > t.cursorLine || (endAt == t.cursorLine && !t.cursorOnAnnotation) {
-						if best == nil || endAt < best.endLine {
-							best = &target{endLine: endAt, idx: 0}
-						}
+		case key.Matches(msg, keys.Resolve, keys.ResolveNext):
+			if t.cursorOnAnnotation {
+				anns := m.annotationsAfterLine(t.cursorLine, t.cursorSide)
+				if t.cursorAnnoIdx < len(anns) {
+					if key.Matches(msg, keys.ResolveNext) {
+						m.resolveNext(anns[t.cursorAnnoIdx].id)
+					} else {
+						m.toggleResolve(anns[t.cursorAnnoIdx].id)
 					}
 				}
-				if best == nil {
-					for _, c := range t.state.Comments {
-						endAt := c.Line
-						if c.EndLine > 0 {
-							endAt = c.EndLine
-						}
-						if best == nil || endAt < best.endLine {
-							best = &target{endLine: endAt, idx: 0}
-						}
-					}
-				}
-				if best != nil {
-					t.cursorLine = best.endLine
-					t.cursorOnAnnotation = true
-					t.cursorAnnoIdx = best.idx
-					moved = true
-				}
-			}
-		case key.Matches(msg, keys.PrevComment):
-			if t.state != nil && len(t.state.Comments) > 0 {
-				type target struct {
-					endLine int
-					idx     int
-				}
-				var best *target
-				for _, c := range t.state.Comments {
-					endAt := c.Line
-					if c.EndLine > 0 {
-						endAt = c.EndLine
-					}
-					if endAt < t.cursorLine || (endAt == t.cursorLine && !t.cursorOnAnnotation) {
-						if best == nil || endAt > best.endLine {
-							best = &target{endLine: endAt, idx: 0}
-						}
-					}
-				}
-				if best == nil {
-					for _, c := range t.state.Comments {
-						endAt := c.Line
-						if c.EndLine > 0 {
-							endAt = c.EndLine
-						}
-						if best == nil || endAt > best.endLine {
-							best = &target{endLine: endAt, idx: 0}
-						}
-					}
-				}
-				if best != nil {
-					t.cursorLine = best.endLine
-					t.cursorOnAnnotation = true
-					t.cursorAnnoIdx = best.idx
-					moved = true
-				}
-			}
-		case key.Matches(msg, keys.NextChange):
-			if len(t.changeChunks) > 0 {
-				target := -1
-				for i, chunk := range t.changeChunks {
-					if chunk.startLine > t.cursorLine {
-						target = i
-						break
-					}
-				}
-				if target == -1 {
-					target = 0
-				}
-				chunk := t.changeChunks[target]
-				t.cursorLine = chunk.startLine
-				t.cursorOnAnnotation = false
-				t.cursorAnnoIdx = 0
-				m.rebuildContent()
-				m.scrollToChunk(chunk)
-				return m, nil
-			}
-		case key.Matches(msg, keys.PrevChange):
-			if len(t.changeChunks) > 0 {
-				target := -1
-				for i := len(t.changeChunks) - 1; i >= 0; i-- {
-					if t.changeChunks[i].startLine < t.cursorLine {
-						target = i
-						break
-					}
-				}
-				if target == -1 {
-					target = len(t.changeChunks) - 1
-				}
-				chunk := t.changeChunks[target]
-				t.cursorLine = chunk.startLine
-				t.cursorOnAnnotation = false
-				t.cursorAnnoIdx = 0
-				m.rebuildContent()
-				m.scrollToChunk(chunk)
 				return m, nil
 			}
 		case key.Matches(msg, keys.Confirm):
 			if t.cursorOnAnnotation {
-				anns := m.annotationsAfterLine(t.cursorLine)
+				anns := m.annotationsAfterLine(t.cursorLine, t.cursorSide)
 				if t.cursorAnnoIdx < len(anns) {
-					ann := anns[t.cursorAnnoIdx]
-					m.editingID = ann.id
-					m.modal = editModal
-					m.modalFocus = 0
-					m.modalTextarea.Reset()
-					m.modalTextarea.SetValue(ann.body)
-					m.modalTextarea.Placeholder = "Edit comment..."
-					m.modalTextarea.Focus()
+					m.openCommentThread(anns[t.cursorAnnoIdx].id)
 					return m, nil
 				}
 			} else if t.state != nil {
-				m.modal = commentModal
-				m.modalFocus = 0
-				m.modalTextarea.Placeholder = "Type your comment..."
-				m.modalTextarea.Reset()
-				m.modalTextarea.Focus()
+				m.openLineComment()
 				return m, nil
 			}
 		}
 
 		if moved {
+			t.cursorOnForm = false
+			if t.cursorLine == 0 && !t.cursorOnAnnotation {
+				m.moveCursorBy(t, 1, 1)
+			}
 			m.rebuildContent()
 			m.scrollToCursor()
 			return m, nil
 		}
 	}
 
+	if m.focused == commentPane {
+		switch {
+		case key.Matches(msg, keys.NextUnresolved):
+			m.jumpToCommentOrFinish(1, false)
+			return m, nil
+		case key.Matches(msg, keys.PrevUnresolved):
+			m.jumpToCommentOrFinish(-1, false)
+			return m, nil
+		case key.Matches(msg, keys.NextComment):
+			m.jumpToCommentOrFinish(1, true)
+			return m, nil
+		case key.Matches(msg, keys.PrevComment):
+			m.jumpToCommentOrFinish(-1, true)
+			return m, nil
+		}
+	}
+
 	// Comment pane navigation
-	if m.focused == commentPane && len(t.sidebarItems) > 0 {
+	if m.focused == commentPane && m.sidebarView == commentsView && len(t.sidebarItems) > 0 {
 		sidebarMoved := false
 		switch {
 		case key.Matches(msg, keys.Down):
@@ -567,23 +1243,30 @@ func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		if sidebarMoved {
 			m.updateCommentSidebar()
+			m.scrollToSidebarCursor()
 			m.rebuildContent()
 			sel := t.sidebarItems[t.sidebarCursor]
-			t.cursorLine = sel.line
-			m.scrollToAnnotation(sel.line, sel.endLine)
+			if !isGeneralCommentScope(sel.scope) {
+				t.cursorLine, t.cursorSide = sel.line, sel.side
+				m.scrollToAnnotation(sel.side, sel.line, sel.endLine)
+			}
+			return m, nil
+		}
+
+		// Toggle resolution on the selected annotation
+		if key.Matches(msg, keys.ResolveNext) {
+			m.resolveNext(t.sidebarItems[t.sidebarCursor].id)
+			return m, nil
+		}
+		if key.Matches(msg, keys.Resolve) {
+			m.toggleResolve(t.sidebarItems[t.sidebarCursor].id)
 			return m, nil
 		}
 
 		// Enter to edit selected annotation
 		if key.Matches(msg, keys.Confirm) {
 			sel := t.sidebarItems[t.sidebarCursor]
-			m.editingID = sel.id
-			m.modal = editModal
-			m.modalFocus = 0
-			m.modalTextarea.Reset()
-			m.modalTextarea.SetValue(sel.body)
-			m.modalTextarea.Placeholder = "Edit comment..."
-			m.modalTextarea.Focus()
+			m.openCommentThread(sel.id)
 			return m, nil
 		}
 	}
@@ -591,76 +1274,810 @@ func (m *AppModel) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *AppModel) openCommentThread(id string) {
+	t := m.tab()
+	if t.state == nil {
+		return
+	}
+	for i := range t.state.Comments {
+		c := &t.state.Comments[i]
+		if c.ID != id {
+			continue
+		}
+		m.editingID = c.ID
+		m.editingReplyID = ""
+		m.modalReferenceOffset = -1
+		m.modalFocus = 0
+		m.modalTextarea.Reset()
+		if reply := m.latestOwnReply(c); reply != nil {
+			m.editingReplyID = reply.ID
+			m.modal = editModal
+			m.modalTextarea.SetValue(reply.Body)
+			m.modalTextarea.Placeholder = "Edit reply..."
+		} else if len(c.Replies) > 0 || !m.authoredThisRound(c.Author, c.ReviewRound) {
+			m.modal = replyModal
+			m.modalTextarea.Placeholder = "Write a reply..."
+		} else {
+			m.modal = editModal
+			m.modalTextarea.SetValue(c.Body)
+			m.modalTextarea.Placeholder = "Edit comment..."
+		}
+		m.modalInitial = m.modalTextarea.Value()
+		m.modalTextarea.Focus()
+		return
+	}
+}
+
+func (m *AppModel) selectedCommentID() string {
+	t := m.tab()
+	switch m.focused {
+	case contentPane:
+		if !t.cursorOnAnnotation {
+			return ""
+		}
+		annotations := m.annotationsAfterLine(t.cursorLine, t.cursorSide)
+		if t.cursorAnnoIdx < len(annotations) {
+			return annotations[t.cursorAnnoIdx].id
+		}
+	case commentPane:
+		if m.sidebarView == commentsView && t.sidebarCursor < len(t.sidebarItems) {
+			return t.sidebarItems[t.sidebarCursor].id
+		}
+	}
+	return ""
+}
+
+func (m *AppModel) openSelectedCommentDelete() {
+	m.openCommentDelete(m.selectedCommentID())
+}
+
+func (m *AppModel) canDeleteComment(id string) bool {
+	if m.tab().state == nil {
+		return false
+	}
+	for _, c := range m.tab().state.Comments {
+		if c.ID == id {
+			return len(c.Replies) == 0 && m.authoredThisRound(c.Author, c.ReviewRound)
+		}
+	}
+	return false
+}
+
+func (m *AppModel) openCommentDelete(id string) {
+	if id == "" {
+		return
+	}
+	m.editingID = id
+	m.editingReplyID = ""
+	if len(m.modalDeleteTargets()) == 0 {
+		m.editingID = ""
+		return
+	}
+	m.openDeleteConfirmation(0)
+}
+
+func (m *AppModel) openLineComment() {
+	if m.tab().path == overallCommentsPath {
+		return
+	}
+	if m.tab().cursorLine == 0 {
+		m.moveCursorBy(m.tab(), 1, 1)
+		if m.tab().cursorLine == 0 {
+			return
+		}
+	}
+	if m.patch != nil && len(m.visualLines(m.tab())) == 0 {
+		return
+	}
+	if m.tab().state == nil {
+		return
+	}
+	m.modal = commentModal
+	m.modalReferenceOffset = -1
+	m.modalFocus = 0
+	m.modalTextarea.Placeholder = "Type your comment..."
+	m.modalTextarea.Reset()
+	m.modalInitial = ""
+	m.modalTextarea.Focus()
+}
+
+func (m *AppModel) latestOwnReply(c *review.Comment) *review.Reply {
+	if len(c.Replies) == 0 {
+		return nil
+	}
+	reply := &c.Replies[len(c.Replies)-1]
+	if !m.authoredThisRound(reply.Author, reply.ReviewRound) {
+		return nil
+	}
+	return reply
+}
+
 func (m *AppModel) modalSubmit() {
 	t := m.tab()
 	body := strings.TrimSpace(m.modalTextarea.Value())
-	if body == "" || t.state == nil {
+	if m.modalTextarea.Value() == m.modalInitial || (body == "" && m.modalInitial == "") {
+		m.discardTextModal()
 		return
 	}
-
-	if m.modal == editModal {
-		for i := range t.state.Comments {
-			if t.state.Comments[i].ID == m.editingID {
-				t.state.Comments[i].Body = body
-				break
-			}
-		}
-		m.editingID = ""
-	} else {
-		startLine, endLine := m.selectionRange()
-		snippet := ""
-		if t.doc != nil {
-			snippet = strings.TrimSpace(t.doc.LineAt(startLine))
-		}
-
-		c := review.Comment{
-			ID:             uuid.NewString()[:8],
-			Line:           startLine,
-			ContentSnippet: snippet,
-			Body:           body,
-			CreatedAt:      time.Now(),
-		}
-		if startLine != endLine {
-			c.EndLine = endLine
-		}
-		t.state.AddComment(c)
+	if body == "" {
+		m.modalDelete(0)
+		return
 	}
+	if t.state == nil {
+		return
+	}
+	var addedLineComment *commentTarget
+	var addedFileCommentID string
 
-	review.Save(t.state)
+	switch m.modal {
+	case editModal:
+		for i := range t.state.Comments {
+			c := &t.state.Comments[i]
+			if c.ID != m.editingID {
+				continue
+			}
+			if m.editingReplyID == "" {
+				c.Body = body
+			} else {
+				for j := range c.Replies {
+					if c.Replies[j].ID == m.editingReplyID {
+						c.Replies[j].Body = body
+						break
+					}
+				}
+			}
+			c.UpdatedAt = review.Now()
+			m.noteFinishFeedback(t.path, c.ID)
+			break
+		}
+	case replyModal:
+		now := review.Now()
+		for i := range t.state.Comments {
+			c := &t.state.Comments[i]
+			if c.ID != m.editingID {
+				continue
+			}
+			c.Replies = append(c.Replies, review.Reply{
+				ID:          review.RandomReplyID(),
+				Body:        body,
+				Author:      m.author,
+				CreatedAt:   now,
+				ReviewRound: m.reviewRound(),
+			})
+			c.UpdatedAt = now
+			m.noteFinishFeedback(t.path, c.ID)
+			break
+		}
+	case commentModal:
+		startLine, endLine := m.selectionRange()
+		side := m.selectionSide()
+		now := review.Now()
+		c := review.Comment{
+			ID:        review.RandomCommentID(),
+			StartLine: startLine,
+			EndLine:   endLine,
+			Side:      side,
+			Anchor:    m.anchorText(t, side, startLine, endLine),
+			Body:      body,
+			Author:    m.author,
+			Scope:     "line",
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		if m.session != nil {
+			c.ReviewRound = m.session.CJ.ReviewRound
+		}
+		addedLineComment = &commentTarget{
+			line: endLine, side: side, annoIdx: len(m.annotationsAfterLine(endLine, side)),
+		}
+		t.state.Comments = append(t.state.Comments, c)
+		m.noteFinishFeedback(t.path, c.ID)
+	case fileCommentModal:
+		now := review.Now()
+		c := review.Comment{
+			ID:        review.RandomCommentID(),
+			Body:      body,
+			Author:    m.author,
+			Scope:     "file",
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		if m.session != nil {
+			c.ReviewRound = m.session.CJ.ReviewRound
+		}
+		if t.path == overallCommentsPath {
+			c.Scope = "review"
+		}
+		addedFileCommentID = c.ID
+		t.state.Comments = append(t.state.Comments, c)
+		m.noteFinishFeedback(t.path, c.ID)
+	}
+	m.newFeedback = true
+	m.editingID = ""
+	m.editingReplyID = ""
+	m.modalInitial = ""
+	m.discardReturn = noModal
+	m.deleteReturn = noModal
+
+	m.persist()
 	m.modal = noModal
 	m.modalTextarea.Blur()
 	t.selecting = false
+	if addedLineComment != nil {
+		m.focused = contentPane
+		m.selectComment(m.activeTab, *addedLineComment)
+		return
+	}
 	m.rebuildContent()
 	m.updateCommentSidebar()
+	if addedFileCommentID != "" {
+		for _, target := range m.commentTargets(m.activeTab) {
+			if target.id == addedFileCommentID {
+				m.selectComment(m.activeTab, target)
+				break
+			}
+		}
+	}
 }
 
-func (m *AppModel) modalDelete() {
+type modalDeleteTarget struct {
+	replyID string
+	label   string
+}
+
+func (m *AppModel) reviewRound() int {
+	if m.session == nil {
+		return 0
+	}
+	return m.session.CJ.ReviewRound
+}
+
+func (m *AppModel) authoredThisRound(author string, round int) bool {
+	return author == m.author && round == m.reviewRound()
+}
+
+func (m *AppModel) modalDeleteTargets() []modalDeleteTarget {
+	t := m.tab()
+	if t.state == nil || m.editingID == "" {
+		return nil
+	}
+	for _, c := range t.state.Comments {
+		if c.ID != m.editingID {
+			continue
+		}
+		if m.editingReplyID == "" {
+			if m.canDeleteComment(c.ID) {
+				return []modalDeleteTarget{{label: "Delete comment"}}
+			}
+			return nil
+		}
+		for i := range c.Replies {
+			reply := &c.Replies[i]
+			if reply.ID == m.editingReplyID && m.authoredThisRound(reply.Author, reply.ReviewRound) {
+				return []modalDeleteTarget{{
+					replyID: reply.ID,
+					label:   fmt.Sprintf("Delete reply %d", i+1),
+				}}
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
+func (m *AppModel) modalDelete(targetIndex int) {
 	t := m.tab()
 	if t.state == nil || m.editingID == "" {
 		return
 	}
-	t.state.DeleteComment(m.editingID)
+	targets := m.modalDeleteTargets()
+	if targetIndex < 0 || targetIndex >= len(targets) {
+		return
+	}
+	target := targets[targetIndex]
+	for i, c := range t.state.Comments {
+		if c.ID != m.editingID {
+			continue
+		}
+		if target.replyID == "" {
+			t.state.Comments = append(t.state.Comments[:i], t.state.Comments[i+1:]...)
+		} else {
+			for j, reply := range c.Replies {
+				if reply.ID == target.replyID {
+					t.state.Comments[i].Replies = append(c.Replies[:j], c.Replies[j+1:]...)
+					t.state.Comments[i].UpdatedAt = review.Now()
+					break
+				}
+			}
+		}
+		break
+	}
 	m.editingID = ""
-	review.Save(t.state)
+	m.editingReplyID = ""
+	m.modalInitial = ""
+	m.discardReturn = noModal
+	m.deleteReturn = noModal
+	m.persist()
 	m.modal = noModal
 	m.modalTextarea.Blur()
 	t.cursorOnAnnotation = false
 	t.cursorAnnoIdx = 0
+	if t.cursorLine == 0 {
+		m.moveCursorBy(t, 1, 1)
+	}
 	m.rebuildContent()
 	m.updateCommentSidebar()
 }
 
+// toggleResolve flips a comment's resolution state, stamping ResolvedRound
+// with the current round on resolve (mirroring crit's reply semantics).
+// toggleResolve flips the resolution of thread id.  With advance, resolving
+// moves on to the next unresolved thread across files, or returns focus to
+// the source when none remain; otherwise the cursor stays where it is.
+// toggleResolve flips the resolution of thread id in place.
+func (m *AppModel) toggleResolve(id string) {
+	m.resolveThread(id, false)
+}
+
+// resolveNext resolves thread id if it is open, keeps it resolved otherwise,
+// and moves on to the next unresolved thread across files, or returns focus
+// to the source when none remain.
+func (m *AppModel) resolveNext(id string) {
+	m.resolveThread(id, true)
+}
+
+func (m *AppModel) resolveThread(id string, advance bool) {
+	t := m.tab()
+	if t.state == nil {
+		return
+	}
+	round := 0
+	if m.session != nil {
+		round = m.session.CJ.ReviewRound
+	}
+	nextTab, next, hasNext := m.adjacentComment(1, false)
+	found := false
+	for i := range t.state.Comments {
+		if t.state.Comments[i].ID != id {
+			continue
+		}
+		c := &t.state.Comments[i]
+		found = true
+		switch {
+		case c.Resolved && advance:
+			// Already resolved: leave it and just move on.
+		case c.Resolved:
+			c.Resolved = false
+			c.ResolvedRound = 0
+			c.UpdatedAt = review.Now()
+		default:
+			c.Resolved = true
+			c.ResolvedRound = round
+			c.UpdatedAt = review.Now()
+			delete(t.expandedDrifted, id)
+		}
+		break
+	}
+	if advance && found {
+		m.releaseThreadFocus()
+	}
+	m.persist()
+	if advance && found && hasNext && (nextTab != m.activeTab || next.id != id) {
+		m.selectComment(nextTab, next)
+		return
+	}
+	m.rebuildContent()
+	m.updateCommentSidebar()
+	if m.focused == contentPane && !t.cursorOnAnnotation {
+		m.scrollToCursor()
+	}
+	// No unresolved thread is left to advance to: move on to submitting.
+	if advance && found {
+		m.openFinishModal()
+	}
+}
+
+// releaseThreadFocus returns focus to the source line under the cursor.
+func (m *AppModel) releaseThreadFocus() {
+	t := m.tab()
+	m.focused = contentPane
+	t.cursorOnAnnotation = false
+	t.cursorAnnoIdx = 0
+	if t.cursorLine == 0 {
+		m.moveCursorBy(t, 1, 1)
+	}
+}
+
+// clickResolve toggles thread id from its header button.  Resolving releases
+// focus; reopening keeps the thread
+// focused so its history is visible again.
+func (m *AppModel) clickResolve(id string) {
+	wasResolved := false
+	if t := m.tab(); t.state != nil {
+		for _, c := range t.state.Comments {
+			if c.ID == id {
+				wasResolved = c.Resolved
+				break
+			}
+		}
+	}
+	m.toggleResolve(id)
+	if wasResolved {
+		return
+	}
+	m.releaseThreadFocus()
+	m.rebuildContent()
+	m.updateCommentSidebar()
+	m.scrollToCursor()
+}
+
+// resolveAll marks every comment thread resolved in the current round.
+func (m *AppModel) resolveAll() {
+	round := 0
+	if m.session != nil {
+		round = m.session.CJ.ReviewRound
+	}
+	now := review.Now()
+	resolve := func(c *review.Comment) {
+		if c.Resolved {
+			return
+		}
+		c.Resolved = true
+		c.ResolvedRound = round
+		c.UpdatedAt = now
+	}
+
+	for i := range m.tabs {
+		if m.tabs[i].state == nil {
+			continue
+		}
+		for j := range m.tabs[i].state.Comments {
+			resolve(&m.tabs[i].state.Comments[j])
+		}
+	}
+	if m.session != nil {
+		for i := range m.session.CJ.ReviewComments {
+			resolve(&m.session.CJ.ReviewComments[i])
+		}
+		for path, file := range m.session.CJ.Files {
+			for i := range file.Comments {
+				resolve(&file.Comments[i])
+			}
+			m.session.CJ.Files[path] = file
+		}
+	}
+	m.persist()
+}
+
+// sessionComments returns the session's stored comments for a file path.
+func (m *AppModel) sessionComments(path string) []review.Comment {
+	if m.session == nil {
+		return []review.Comment{}
+	}
+	comments := m.session.FileComments(path)
+	if path == overallCommentsPath {
+		comments = m.session.CJ.ReviewComments
+	}
+	if comments == nil {
+		comments = []review.Comment{}
+	}
+	return comments
+}
+
+// anchorText joins the full text of lines start..end as the comment's
+// drift-correction anchor.
+func (m *AppModel) anchorText(t *FileTab, side string, start, end int) string {
+	if t.doc == nil {
+		return ""
+	}
+	lines := make([]string, 0, end-start+1)
+	if side == "old" {
+		byLine := make(map[int]string)
+		for _, dels := range t.deletedAfter {
+			for _, del := range dels {
+				if del.OldLineNum >= start && del.OldLineNum <= end {
+					byLine[del.OldLineNum] = del.Content
+				}
+			}
+		}
+		for line := start; line <= end; line++ {
+			if content, ok := byLine[line]; ok {
+				lines = append(lines, content)
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
+	for l := start; l <= end && l <= t.doc.LineCount(); l++ {
+		if !t.doc.HasLine(l) {
+			return ""
+		}
+		lines = append(lines, t.doc.LineAt(l))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *AppModel) insertSuggestion() {
+	start, end, ok := m.suggestionRange()
+	if !ok {
+		return
+	}
+	code := m.anchorText(m.tab(), "", start, end)
+	if code == "" {
+		return
+	}
+	body := strings.TrimRight(m.modalTextarea.Value(), "\n")
+	if body != "" {
+		body += "\n\n"
+	}
+	m.modalTextarea.SetValue(body + "```suggestion\n" + code + "\n```")
+	m.modalFocus = 0
+	m.modalTextarea.Focus()
+	m.modalTextarea.CursorStart()
+	m.modalTextarea.CursorUp()
+	firstLine := strings.Count(body, "\n") + 1
+	for m.modalTextarea.Line() > firstLine {
+		m.modalTextarea.CursorUp()
+	}
+	m.modalTextarea.CursorStart()
+	// Anchor the selection at the code start, then extend it back from the
+	// closing fence to the code end without selecting either fence.
+	m.modalTextarea, _ = m.modalTextarea.Update(tea.KeyPressMsg{Code: tea.KeyRight, Mod: tea.ModShift})
+	m.modalTextarea.MoveToEnd()
+	m.modalTextarea.CursorStart()
+	m.modalTextarea, _ = m.modalTextarea.Update(tea.KeyPressMsg{Code: tea.KeyLeft, Mod: tea.ModShift})
+	// Populate the internal viewport before repositioning it around the cursor.
+	_ = m.modalTextarea.View()
+	m.modalTextarea.SetHeight(m.modalTextarea.Height())
+}
+
+func (m *AppModel) suggestionRange() (int, int, bool) {
+	if m.modal == commentModal {
+		if m.selectionSide() == "old" {
+			return 0, 0, false
+		}
+		start, end := m.selectionRange()
+		return start, end, true
+	}
+	if m.modal != replyModal && m.modal != editModal {
+		return 0, 0, false
+	}
+	t := m.tab()
+	if t.state == nil {
+		return 0, 0, false
+	}
+	for _, c := range t.state.Comments {
+		if c.ID == m.editingID && !isGeneralCommentScope(c.Scope) && c.Side != "old" && c.StartLine > 0 {
+			return c.StartLine, c.EndAt(), true
+		}
+	}
+	return 0, 0, false
+}
+
+func (m *AppModel) canSuggest() bool {
+	start, end, ok := m.suggestionRange()
+	if !ok {
+		return false
+	}
+	if doc := m.tab().doc; doc != nil && doc.Known != nil {
+		for line := start; line <= end; line++ {
+			if !doc.HasLine(line) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (m *AppModel) modalDeleteStartFocus() int {
+	if m.canSuggest() {
+		return 4
+	}
+	return 3
+}
+
+// persist writes every tab's comments back into the session and saves it.
+func (m *AppModel) persist() {
+	if m.session == nil {
+		return
+	}
+	for i := range m.tabs {
+		if m.tabs[i].state == nil {
+			continue
+		}
+		if m.tabs[i].path == overallCommentsPath {
+			m.session.CJ.ReviewComments = m.tabs[i].state.Comments
+		} else {
+			m.session.SetFileComments(m.tabs[i].path, "", m.tabs[i].state.Comments)
+		}
+	}
+	m.session.CJ.RoundState.NewFeedback = m.newFeedback
+	if err := m.session.Save(); err != nil {
+		m.err = err
+		return
+	}
+	m.refreshSavedComments()
+}
+
+func (m *AppModel) refreshSavedComments() {
+	m.ensureOverallCommentsTab()
+	for i := range m.tabs {
+		if m.tabs[i].state != nil {
+			m.tabs[i].state.Comments = m.sessionComments(m.tabs[i].path)
+		}
+	}
+}
+
+// unresolvedTotal counts unresolved comments across tabs and the session's
+// review-level comments.
+func (m *AppModel) unresolvedTotal() int {
+	n := 0
+	for i := range m.tabs {
+		if m.tabs[i].state == nil || m.tabs[i].path == overallCommentsPath {
+			continue
+		}
+		for _, c := range m.tabs[i].state.Comments {
+			if !c.Resolved {
+				n++
+			}
+		}
+	}
+	if m.session != nil {
+		for _, c := range m.session.CJ.ReviewComments {
+			if !c.Resolved {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// doFinish saves the completed round before closing the TUI.
+func (m *AppModel) doFinish() (tea.Model, tea.Cmd) {
+	if m.finishSaveFailed {
+		m.err, m.finishSaveFailed = nil, false
+	}
+	verdict := m.finishVerdict
+	if !verdict.Valid() {
+		verdict = m.defaultFinishVerdict()
+	}
+	if verdict == review.VerdictApprove {
+		if m.modal == finishModal {
+			m.saveFinishDraft()
+		} else {
+			m.persist()
+		}
+		if m.err != nil {
+			m.finishSaveFailed = true
+			return m, nil
+		}
+		if len(m.missingForms()) > 0 {
+			m.finishVerdict = verdict
+			m.modal, m.modalFocus = finishFormsModal, finishReviewForms
+			m.modalTextarea.Blur()
+			return m, nil
+		}
+	}
+	m.finishVerdict = verdict
+	if len(m.unviewedForms()) > 0 {
+		m.modal, m.modalFocus = finishFormsModal, finishReviewForms
+		m.modalTextarea.Blur()
+		return m, nil
+	}
+	return m.continueFinish()
+}
+
+// continueFinish submits the selected verdict after form checks.
+func (m *AppModel) continueFinish() (tea.Model, tea.Cmd) {
+	if m.finishVerdict == review.VerdictApprove {
+		return m.confirmFormApproval()
+	}
+	if m.modal == finishFormsModal {
+		m.modal = finishModal
+	}
+	return m.submitReview(m.finishVerdict)
+}
+
+func (m *AppModel) submitReview(verdict review.Verdict) (tea.Model, tea.Cmd) {
+	if !verdict.Valid() {
+		m.err = fmt.Errorf("invalid review verdict: %q", verdict)
+		return m, nil
+	}
+	if verdict == review.VerdictApprove && len(m.missingForms()) > 0 {
+		m.clipboardStatus = "Complete required confirmations before approving."
+		return m, nil
+	}
+	m.finishVerdict = verdict
+	if m.modal == finishModal {
+		m.finishDraft = m.modalTextarea.Value()
+	}
+	if m.session != nil {
+		m.persist()
+		if m.err != nil {
+			m.finishSaveFailed = true
+			return m, nil
+		}
+		m.session.SetSubmission(verdict, m.finishDraft, m.author)
+		m.refreshSavedComments()
+		m.session.CJ.RoundState.ReviewCommentDraft = m.finishDraft
+	}
+	if verdict == review.VerdictApprove {
+		m.resolveAll()
+	} else {
+		m.persist()
+	}
+	if m.err != nil {
+		m.finishSaveFailed = true
+		return m, nil
+	}
+	if verdict == review.VerdictApprove && m.unresolvedTotal() > 0 {
+		m.err = fmt.Errorf("new feedback arrived while approving; review it before retrying")
+		m.finishSaveFailed = true
+		return m, nil
+	}
+	if m.session != nil {
+		previous := m.session.CJ.RoundState
+		m.session.CJ.RoundState.Finished = true
+		m.session.CJ.RoundState.SubmittedReplies = m.replyIDs()
+		if err := m.session.Save(); err != nil {
+			m.session.CJ.RoundState = previous
+			m.err, m.finishSaveFailed = err, true
+			return m, nil
+		}
+		m.refreshSavedComments()
+		if verdict == review.VerdictApprove && m.unresolvedTotal() > 0 {
+			m.failSubmission(fmt.Errorf("new feedback arrived while approving; review it before retrying"))
+			return m, nil
+		}
+	}
+	approved := verdict == review.VerdictApprove
+	var result *review.FormResult
+	if m.forms != nil && m.forms.HasForms() {
+		value := m.forms.Result(approved, m.session.CJ.ReviewRound)
+		value.Session = m.session.Key
+		value.Verdict = verdict
+		value.ReviewComment = m.session.SubmissionComment()
+		if err := m.session.SaveFormResult(value); err != nil {
+			m.failSubmission(err)
+			return m, nil
+		}
+		result = &value
+	}
+	if m.finishCh != nil {
+		m.finishCh <- FinishEvent{Approved: approved, Result: result}
+	}
+	m.modal = noModal
+	return m, tea.Quit
+}
+
 func (m *AppModel) handleTextModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	// Number of focusable elements: edit modal has 4 (textarea, save, cancel, delete), comment modal has 3
+	m.clipboardStatus = ""
+	if msg.String() == "alt+o" && m.modalFocus == 0 {
+		return m, m.openReferenceAtCursor()
+	}
+	if msg.String() == "alt+r" && m.hasModalResolution() {
+		m.toggleResolve(m.editingID)
+		return m, nil
+	}
+	if m.handleCompletionKey(msg) {
+		return m, nil
+	}
 	focusCount := 3
+	if m.canSuggest() {
+		focusCount++
+	}
 	if m.modal == editModal {
-		focusCount = 4
+		focusCount += len(m.modalDeleteTargets())
 	}
 
 	switch msg.String() {
 	case "esc":
-		m.modal = noModal
-		m.modalTextarea.Blur()
+		m.closeTextModal()
+		return m, nil
+	case "ctrl+pgup":
+		m.scrollModalReference(-1)
+		return m, nil
+	case "ctrl+pgdown":
+		m.scrollModalReference(1)
 		return m, nil
 	case "tab", "shift+tab":
 		if msg.String() == "shift+tab" {
@@ -679,19 +2096,47 @@ func (m *AppModel) handleTextModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.modalSubmit()
 			return m, nil
 		} else if m.modalFocus == 2 {
-			m.modal = noModal
-			m.modalTextarea.Blur()
+			m.closeTextModal()
 			return m, nil
-		} else if m.modalFocus == 3 && m.modal == editModal {
-			m.modalDelete()
+		} else if m.canSuggest() && m.modalFocus == 3 {
+			m.insertSuggestion()
+			return m, nil
+		} else if m.modal == editModal && m.modalFocus >= m.modalDeleteStartFocus() {
+			m.openDeleteConfirmation(m.modalFocus - m.modalDeleteStartFocus())
 			return m, nil
 		}
 	case "ctrl+s":
 		m.modalSubmit()
 		return m, nil
+	case "ctrl+v":
+		if m.modalFocus == 0 {
+			return m, m.pasteClipboardImage()
+		}
+		return m, nil
+	case "ctrl+o":
+		if m.modalFocus == 0 {
+			return m, m.openExternalEditor()
+		}
+		return m, nil
+	case "alt+s":
+		if m.canSuggest() {
+			m.insertSuggestion()
+		}
+		return m, nil
+	case "alt+w":
+		// Experimental: copy the current kill ring entry to the system
+		// clipboard through OSC 52 without disturbing a yank sequence.
+		if text := m.killRing.current(); m.modalFocus == 0 && text != "" {
+			m.clipboardStatus = "Copied to system clipboard: " + ansi.Truncate(strings.ReplaceAll(text, "\n", "⏎"), 40, "…")
+			return m, tea.SetClipboard(text)
+		}
+		return m, nil
 	}
 
 	if m.modalFocus == 0 {
+		if handled, cmd := m.updateKillRing(msg); handled {
+			return m, cmd
+		}
 		var cmd tea.Cmd
 		m.modalTextarea, cmd = m.modalTextarea.Update(msg)
 		return m, cmd
@@ -699,91 +2144,138 @@ func (m *AppModel) handleTextModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *AppModel) handleTabSearch(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc":
-		m.tabSearching = false
-		m.tabSearch = ""
-		m.tabMatches = nil
-		return m, nil
-	case "enter":
-		if len(m.tabMatches) > 0 {
-			m.activeTab = m.tabMatches[0]
-			m.rebuildContent()
-			m.updateCommentSidebar()
+func (m *AppModel) scrollModalReference(direction int) {
+	for _, region := range m.modalMouseRegions() {
+		if !region.action.scrollable {
+			continue
 		}
-		m.tabSearching = false
-		m.tabSearch = ""
-		m.tabMatches = nil
-		return m, nil
-	case "backspace":
-		if len(m.tabSearch) > 0 {
-			m.tabSearch = m.tabSearch[:len(m.tabSearch)-1]
-			m.updateTabSearchMatches()
-		}
-		return m, nil
-	case "tab":
-		// Cycle to next match
-		if len(m.tabMatches) > 1 {
-			// Rotate matches
-			m.tabMatches = append(m.tabMatches[1:], m.tabMatches[0])
-		}
-		return m, nil
-	default:
-		s := msg.String()
-		if len(s) == 1 && s[0] >= ' ' && s[0] <= '~' {
-			m.tabSearch += s
-			m.updateTabSearchMatches()
-		}
-		return m, nil
+		pageSize := max(1, region.rect.bottom-region.rect.top-2)
+		offset := region.action.scrollOffset + direction*pageSize
+		m.modalReferenceOffset = max(0, min(region.action.scrollMaxOffset, offset))
+		return
 	}
 }
 
-func (m *AppModel) updateTabSearchMatches() {
-	m.tabMatches = nil
-	if m.tabSearch == "" {
+func (m *AppModel) closeTextModal() {
+	if m.modalTextarea.Value() != m.modalInitial {
+		m.discardReturn = m.modal
+		m.modal = discardChangesModal
+		m.modalFocus = 1
+		m.modalTextarea.Blur()
 		return
 	}
-	query := strings.ToLower(m.tabSearch)
-	for i, t := range m.tabs {
-		if strings.Contains(strings.ToLower(t.path), query) {
-			m.tabMatches = append(m.tabMatches, i)
+	m.discardTextModal()
+}
+
+func (m *AppModel) discardTextModal() {
+	m.modal = noModal
+	m.discardReturn = noModal
+	m.deleteReturn = noModal
+	m.editingID = ""
+	m.editingReplyID = ""
+	m.modalInitial = ""
+	m.modalTextarea.Blur()
+	m.modalTextarea.Reset()
+	m.completion = completionState{}
+}
+
+func (m *AppModel) resumeTextModal() {
+	m.modal = m.discardReturn
+	m.discardReturn = noModal
+	m.modalFocus = 0
+	m.modalTextarea.Focus()
+}
+
+func (m *AppModel) handleDiscardChangesModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y":
+		m.discardTextModal()
+	case "n", "N", "esc":
+		m.resumeTextModal()
+	case "left", "right", "h", "l", "tab", "shift+tab":
+		m.modalFocus = 1 - m.modalFocus
+	case "enter":
+		if m.modalFocus == 0 {
+			m.discardTextModal()
+		} else {
+			m.resumeTextModal()
 		}
 	}
+	return m, nil
+}
+
+func (m *AppModel) openDeleteConfirmation(targetIndex int) {
+	if targetIndex < 0 || targetIndex >= len(m.modalDeleteTargets()) {
+		return
+	}
+	m.deleteReturn = m.modal
+	m.pendingDelete = targetIndex
+	m.modal = deleteConfirmModal
+	m.modalFocus = 1
+	m.modalTextarea.Blur()
+}
+
+func (m *AppModel) cancelDeleteConfirmation() {
+	if m.deleteReturn == noModal {
+		m.modal = noModal
+		m.editingID = ""
+		m.editingReplyID = ""
+		m.pendingDelete = 0
+		m.modalFocus = 0
+		return
+	}
+	m.modal = m.deleteReturn
+	m.deleteReturn = noModal
+	m.modalFocus = m.modalDeleteStartFocus() + m.pendingDelete
+}
+
+func (m *AppModel) confirmDelete() {
+	target := m.pendingDelete
+	m.deleteReturn = noModal
+	m.modalDelete(target)
+}
+
+func (m *AppModel) handleDeleteConfirmModal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y":
+		m.confirmDelete()
+	case "n", "N", "esc":
+		m.cancelDeleteConfirmation()
+	case "left", "right", "h", "l", "tab", "shift+tab":
+		m.modalFocus = 1 - m.modalFocus
+	case "enter":
+		if m.modalFocus == 0 {
+			m.confirmDelete()
+		} else {
+			m.cancelDeleteConfirmation()
+		}
+	}
+	return m, nil
 }
 
 func (m *AppModel) recalculateLayout() {
-	headerHeight := 1
-	if m.detached {
-		headerHeight = 2
+	headerHeight := m.headerHeight()
+	tabBarHeight := m.tabBarHeight()
+	footerHeight := 0
+	if len(m.tabs) > 0 && m.tab().state != nil {
+		if footer := m.renderFooter(); footer != "" {
+			footerHeight = lipgloss.Height(footer)
+		}
 	}
-	tabBarHeight := 0
-	if m.multiFile {
-		tabBarHeight = 3 // bordered tabs: top border + content + bottom border
-	}
-	footerHeight := 1
-	tmuxPadding := 0
-	if os.Getenv("TMUX") != "" {
-		tmuxPadding = 1
-	}
-	frameBorderHeight := 0
-	frameBorderWidth := 0
-	if m.multiFile {
-		frameBorderHeight = 1 // bottom border
-		frameBorderWidth = 2  // left + right borders
-	}
-	mainHeight := m.height - headerHeight - tabBarHeight - footerHeight - frameBorderHeight - tmuxPadding
+	// The tab bar serves as the top border of the content pane; one row
+	// remains for the bottom border.
+	mainHeight := max(0, m.height-headerHeight-tabBarHeight-footerHeight-1)
 
-	commentWidth := m.width / 4
-	if commentWidth < 20 {
-		commentWidth = 20
-	}
-	contentWidth := m.width - commentWidth - frameBorderWidth
+	// The comment pane (or the gutter when comments are hidden) takes
+	// commentPanelWidth columns; the content pane's borders take two.
+	contentWidth := m.width - m.commentPanelWidth() - 2
 
 	m.contentViewport.SetWidth(contentWidth)
 	m.contentViewport.SetHeight(mainHeight)
-	m.commentViewport.SetWidth(commentWidth - 3) // -3 for left border + padding + margin
-	m.commentViewport.SetHeight(mainHeight - 1)  // -1 for the "Comments (N)" header line
+	m.commentViewport.SetWidth(max(0, m.commentPanelWidth()-2-paneHorizontalPadding*2))
+	m.commentViewport.SetHeight(mainHeight)
+	m.fileTree.viewport.SetWidth(m.commentViewport.Width())
+	m.fileTree.viewport.SetHeight(mainHeight)
 
 	modalWidth := m.width * 2 / 3
 	if modalWidth < 50 {
@@ -794,694 +2286,110 @@ func (m *AppModel) recalculateLayout() {
 	}
 	m.modalTextarea.SetWidth(modalWidth - 10)
 	m.modalTextarea.SetHeight(6)
+	if m.modal == finishModal {
+		m.modalTextarea.SetHeight(m.finishTextareaHeight())
+	}
 }
 
 // annotationsAfterLine returns annotations that render after the given line
 // (keyed by their endLine).
-func (m *AppModel) annotationsAfterLine(lineNum int) []annotation {
+func (m *AppModel) annotationsAfterLine(lineNum int, side string) []annotation {
 	t := m.tab()
 	if t.state == nil {
 		return nil
 	}
 	var anns []annotation
 	for _, c := range t.state.Comments {
-		endAt := c.Line
-		if c.EndLine > 0 {
-			endAt = c.EndLine
-		}
-		if endAt == lineNum {
-			anns = append(anns, annotation{
-				id: c.ID, body: c.Body,
-				line: c.Line, endLine: c.EndLine,
-			})
+		if commentLocation(t, c) == (lineRef{line: lineNum, side: side}) {
+			anns = append(anns, tabAnnotation(t, c))
 		}
 	}
 	return anns
 }
 
+type commentTarget struct {
+	id       string
+	scope    string
+	resolved bool
+	line     int
+	side     string
+	annoIdx  int
+	formID   string
+	required bool
+	first    bool
+}
+
 // sidebarItem represents a comment in the sidebar list.
 type sidebarItem struct {
-	id      string
-	line    int
-	endLine int
-	body    string
+	drifted       bool
+	id            string
+	scope         string
+	line          int
+	endLine       int
+	side          string
+	body          string
+	author        string
+	replies       []review.Reply
+	resolved      bool
+	resolvedRound int
 }
 
 // annotation represents an inline comment to render.
 type annotation struct {
-	id      string
-	body    string
-	line    int
-	endLine int
+	drifted       bool
+	id            string
+	scope         string
+	body          string
+	line          int
+	endLine       int
+	side          string
+	author        string
+	resolved      bool
+	resolvedRound int
+	replies       []review.Reply
 }
 
-// rebuildContent renders the document line-by-line with cursor, selection,
-// line numbers, and bordered inline annotations.
-func (m *AppModel) rebuildContent() {
-	t := m.tab()
-
-	// Handle placeholder tabs
-	if t.isBinary {
-		m.contentViewport.SetContent("\n  Binary file changed — cannot display content.\n")
-		return
+func newAnnotation(c review.Comment) annotation {
+	return annotation{
+		id: c.ID, body: c.Body, scope: c.Scope,
+		line: c.StartLine, endLine: c.EndLine, side: c.Side,
+		author: c.Author, resolved: c.Resolved, resolvedRound: c.ResolvedRound, replies: c.Replies,
 	}
-	if t.isDeleted {
-		m.contentViewport.SetContent("\n  File deleted.\n")
-		return
-	}
-
-	if t.doc == nil {
-		return
-	}
-
-	// Collect annotations keyed by the line they appear AFTER
-	annosByEndLine := make(map[int][]annotation)
-	if t.state != nil {
-		for _, c := range t.state.Comments {
-			endAt := c.Line
-			if c.EndLine > 0 {
-				endAt = c.EndLine
-			}
-			annosByEndLine[endAt] = append(annosByEndLine[endAt], annotation{
-				id: c.ID, body: c.Body,
-				line: c.Line, endLine: c.EndLine,
-			})
-		}
-	}
-
-	// Count how many comments cover each line (for overlap detection)
-	annotatedLines := make(map[int]int)
-	if t.state != nil {
-		for _, c := range t.state.Comments {
-			end := c.Line
-			if c.EndLine > 0 {
-				end = c.EndLine
-			}
-			for l := c.Line; l <= end; l++ {
-				annotatedLines[l]++
-			}
-		}
-	}
-
-	selStart, selEnd := m.selectionRange()
-
-	// Determine which lines to highlight from selected annotation
-	var sidebarHighlightStart, sidebarHighlightEnd int
-	if m.focused == commentPane && len(t.sidebarItems) > 0 && t.sidebarCursor < len(t.sidebarItems) {
-		sel := t.sidebarItems[t.sidebarCursor]
-		sidebarHighlightStart = sel.line
-		sidebarHighlightEnd = sel.line
-		if sel.endLine > 0 {
-			sidebarHighlightEnd = sel.endLine
-		}
-	} else if m.focused == contentPane && t.cursorOnAnnotation {
-		anns := m.annotationsAfterLine(t.cursorLine)
-		if t.cursorAnnoIdx < len(anns) {
-			ann := anns[t.cursorAnnoIdx]
-			sidebarHighlightStart = ann.line
-			sidebarHighlightEnd = ann.line
-			if ann.endLine > 0 {
-				sidebarHighlightEnd = ann.endLine
-			}
-		}
-	}
-
-	contentWidth := m.contentViewport.Width()
-	boxWidth := contentWidth - 7
-	if boxWidth < 20 {
-		boxWidth = 20
-	}
-
-	textWidth := contentWidth - 8
-	if textWidth < 10 {
-		textWidth = 10
-	}
-
-	// Use cached syntax highlighting
-	isMarkdown := t.isMarkdown
-	chromaLines := t.chromaLines
-
-	// Detect table blocks so we can align columns across rows
-	tableBlocks := detectTableBlocks(t.doc.Lines)
-	tableBlockMap := make(map[int]*tableBlock)
-	for i := range tableBlocks {
-		tb := &tableBlocks[i]
-		for l := tb.startLine; l <= tb.endLine; l++ {
-			tableBlockMap[l] = tb
-		}
-	}
-
-	// inlineBg applies a background color to just the content text (no full-width padding).
-	// For content with embedded ANSI codes (Chroma), it re-injects the bg after resets.
-	inlineBg := func(style lipgloss.Style, content string) string {
-		bgAnsi := bgToAnsi(style.GetBackground())
-		if bgAnsi == "" {
-			return style.Render(content)
-		}
-		patched := strings.ReplaceAll(content, "\033[0m", "\033[0m"+bgAnsi)
-		return bgAnsi + patched + "\033[0m"
-	}
-
-	var b strings.Builder
-	b.Grow(len(t.doc.Lines) * 200) // pre-allocate to reduce allocations
-	for i, line := range t.doc.Lines {
-		lineNum := i + 1
-
-		// Render deleted lines that appear before this line
-		if dels, ok := t.deletedAfter[lineNum-1]; ok {
-			cachedHL := t.deletedLineCache[lineNum-1]
-			for di, del := range dels {
-				delMarker := diffDeletedGutter.Render("-")
-				delNum := diffDeletedLineNum.Render(fmt.Sprintf("%d", del.OldLineNum))
-				delContent := del.Content
-				if cachedHL != nil && di < len(cachedHL) {
-					delContent = cachedHL[di]
-				}
-				b.WriteString(fmt.Sprintf("%s%s %s\n", delMarker, delNum, inlineBg(diffDeletedLineBg, delContent)))
-			}
-		}
-
-		isCursor := lineNum == t.cursorLine
-		isSelected := t.selecting && lineNum >= selStart && lineNum <= selEnd
-		isSidebarHighlight := sidebarHighlightStart > 0 && lineNum >= sidebarHighlightStart && lineNum <= sidebarHighlightEnd
-		isChanged := t.changedLines != nil && t.changedLines[lineNum]
-
-		// Marker column
-		var marker string
-		if isCursor && !t.cursorOnAnnotation {
-			marker = cursorMarker.Render(">")
-		} else if isSelected {
-			marker = selectedMarker.Render("|")
-		} else if isSidebarHighlight {
-			marker = cursorMarker.Render(">")
-		} else if count, ok := annotatedLines[lineNum]; ok && count > 0 {
-			if count > 1 {
-				marker = gutterOverlap.Render("◆")
-			} else {
-				marker = annotationGutter.Render("■")
-			}
-		} else if isChanged {
-			marker = diffAddedGutter.Render("+")
-		} else {
-			marker = " "
-		}
-
-		// Line number
-		var numStr string
-		if isCursor {
-			numStr = cursorLineNumStyle.Render(fmt.Sprintf("%d", lineNum))
-		} else if isSelected {
-			numStr = selectedLineNumStyle.Render(fmt.Sprintf("%d", lineNum))
-		} else {
-			numStr = lineNumStyle.Render(fmt.Sprintf("%d", lineNum))
-		}
-
-		// Check if this line is part of a table block
-		if tb, inTable := tableBlockMap[lineNum]; inTable {
-			var styledLine string
-			if reTableSep.MatchString(line) {
-				styledLine = formatTableSep(tb.colWidths)
-			} else {
-				isHeader := lineNum == tb.startLine
-				styledLine = formatTableRow(line, tb.colWidths, isHeader)
-			}
-
-			if isSelected {
-				styledLine = inlineBg(selectedLineBg, styledLine)
-			} else if isSidebarHighlight {
-				styledLine = inlineBg(sidebarHighlightBg, styledLine)
-			} else if isChanged {
-				styledLine = inlineBg(diffChangedLineBg, styledLine)
-			}
-
-			b.WriteString(fmt.Sprintf("%s%s %s\n", marker, numStr, styledLine))
-		} else {
-			// Get the display content: Chroma-highlighted or raw
-			displayLine := line
-			if !isMarkdown && chromaLines != nil && i < len(chromaLines) {
-				displayLine = chromaLines[i]
-			}
-
-			// For Chroma-highlighted content, we skip wrapping (ANSI codes break lipgloss.Wrap)
-			// and apply background overlays directly.
-			if !isMarkdown && chromaLines != nil && i < len(chromaLines) {
-				styledLine := displayLine
-				if isSelected {
-					styledLine = inlineBg(selectedLineBg, styledLine)
-				} else if isSidebarHighlight {
-					styledLine = inlineBg(sidebarHighlightBg, styledLine)
-				} else if isChanged {
-					styledLine = inlineBg(diffChangedLineBg, styledLine)
-				}
-				b.WriteString(fmt.Sprintf("%s%s %s\n", marker, numStr, styledLine))
-			} else {
-				// Markdown or plain text path with wrapping
-				styleFunc := func(s string) string { return s }
-				if isMarkdown {
-					styleFunc = func(s string) string { return highlightMarkdown(s) }
-				}
-				if isSelected {
-					styleFunc = func(s string) string { return inlineBg(selectedLineBg, s) }
-				} else if isSidebarHighlight {
-					styleFunc = func(s string) string { return inlineBg(sidebarHighlightBg, s) }
-				} else if isChanged {
-					base := styleFunc
-					styleFunc = func(s string) string { return inlineBg(diffChangedLineBg, base(s)) }
-				}
-
-				wrapped := lipgloss.Wrap(line, textWidth, "")
-				wrappedLines := strings.Split(wrapped, "\n")
-				for wi, wl := range wrappedLines {
-					if wi == 0 {
-						b.WriteString(fmt.Sprintf("%s%s %s\n", marker, numStr, styleFunc(wl)))
-					} else {
-						b.WriteString(fmt.Sprintf(" %s %s\n", continuationGutter, styleFunc(wl)))
-					}
-				}
-			}
-		}
-
-		// Render inline annotations after this line
-		if anns, ok := annosByEndLine[lineNum]; ok {
-			for idx, ann := range anns {
-				focused := m.focused == contentPane && t.cursorOnAnnotation && t.cursorLine == lineNum && t.cursorAnnoIdx == idx
-				b.WriteString(m.renderAnnotationBox(ann, boxWidth, focused))
-			}
-		}
-	}
-
-	m.contentViewport.SetContent(b.String())
-}
-
-// renderAnnotationBox renders a bordered annotation box indented under the gutter.
-func (m *AppModel) renderAnnotationBox(ann annotation, maxWidth int, focused bool) string {
-	var lineLabel string
-	if ann.endLine > 0 {
-		lineLabel = fmt.Sprintf("L%d-%d", ann.line, ann.endLine)
-	} else {
-		lineLabel = fmt.Sprintf("L%d", ann.line)
-	}
-
-	var boxContent strings.Builder
-	label := inlineLabelComment.Render("comment")
-	lineRef := commentLineStyle.Render(lineLabel)
-	boxContent.WriteString(fmt.Sprintf("%s %s\n", label, lineRef))
-	boxContent.WriteString(clampLines(ann.body, 3))
-	boxStyle := inlineCommentBox
-
-	if focused {
-		boxStyle = boxStyle.BorderForeground(warning)
-	}
-	box := boxStyle.Width(maxWidth).Render(boxContent.String())
-
-	var prefix string
-	if focused {
-		cursor := lipgloss.NewStyle().Width(2).Render(cursorMarker.Render(">"))
-		prefix = cursor + strings.Repeat(" ", gutterWidth-2)
-	} else {
-		prefix = strings.Repeat(" ", gutterWidth)
-	}
-
-	var b strings.Builder
-	for _, line := range strings.Split(box, "\n") {
-		b.WriteString(prefix + line + "\n")
-	}
-	return b.String()
-}
-
-var (
-	reBold       = regexp.MustCompile(`\*\*(.+?)\*\*`)
-	reItalic     = regexp.MustCompile(`(?:^|[^*])\*([^*]+?)\*(?:[^*]|$)`)
-	reCode       = regexp.MustCompile("`([^`]+)`")
-	reLink       = regexp.MustCompile(`\[([^\]]+)\]\([^)]+\)`)
-	reListItem   = regexp.MustCompile(`^(\s*[-*+]\s)(.*)$`)
-	reCheckbox   = regexp.MustCompile(`^(\s*[-*+]\s)\[([ xX])\]\s(.*)$`)
-	reNumList    = regexp.MustCompile(`^(\s*\d+\.\s)(.*)$`)
-	reBlockquote = regexp.MustCompile(`^(\s*>\s?)(.*)$`)
-	reHr         = regexp.MustCompile(`^(\s*)([-*_]{3,})\s*$`)
-	reTableRow   = regexp.MustCompile(`^\s*\|.*\|\s*$`)
-	reTableSep   = regexp.MustCompile(`^\s*\|[\s:]*[-]+[\s:|-]*\|\s*$`)
-)
-
-// highlightMarkdown applies markdown syntax highlighting to a single line.
-func highlightMarkdown(line string) string {
-	trimmed := strings.TrimSpace(line)
-
-	if reHr.MatchString(line) {
-		return mdHrStyle.Render("─────────────────────────────────")
-	}
-
-	if strings.HasPrefix(trimmed, "#### ") {
-		return mdH4Style.Render(line)
-	}
-	if strings.HasPrefix(trimmed, "### ") {
-		return mdH3Style.Render(line)
-	}
-	if strings.HasPrefix(trimmed, "## ") {
-		return mdH2Style.Render(line)
-	}
-	if strings.HasPrefix(trimmed, "# ") {
-		return mdH1Style.Render(line)
-	}
-
-	if reTableSep.MatchString(line) {
-		return mdTableSepStyle.Render(line)
-	}
-	if reTableRow.MatchString(line) {
-		cells := strings.Split(line, "|")
-		var parts []string
-		for i, cell := range cells {
-			if i == 0 || i == len(cells)-1 {
-				parts = append(parts, cell)
-			} else {
-				parts = append(parts, highlightInline(cell))
-			}
-		}
-		return strings.Join(parts, mdTablePipe.Render("|"))
-	}
-
-	if loc := reBlockquote.FindStringSubmatchIndex(line); loc != nil {
-		rest := line[loc[4]:loc[5]]
-		return mdBlockquoteBar.Render("▎") + " " + mdBlockquoteStyle.Render(rest)
-	}
-
-	if loc := reCheckbox.FindStringSubmatchIndex(line); loc != nil {
-		indent := line[loc[2]:loc[3]]
-		checked := line[loc[4]:loc[5]]
-		rest := line[loc[6]:loc[7]]
-		if checked == "x" || checked == "X" {
-			return indent + mdCheckboxDone.Render("✓") + " " + mdCheckboxDoneText.Render(rest)
-		}
-		return indent + mdCheckboxOpen.Render("☐") + " " + highlightInline(rest)
-	}
-
-	if loc := reListItem.FindStringSubmatchIndex(line); loc != nil {
-		indent := line[loc[2]:loc[3]]
-		rest := line[loc[4]:loc[5]]
-		return mdListMarkerStyle.Render(indent) + highlightInline(rest)
-	}
-	if loc := reNumList.FindStringSubmatchIndex(line); loc != nil {
-		marker := line[loc[2]:loc[3]]
-		rest := line[loc[4]:loc[5]]
-		return mdListMarkerStyle.Render(marker) + highlightInline(rest)
-	}
-
-	return highlightInline(line)
-}
-
-// tableBlock represents a contiguous range of markdown table lines.
-type tableBlock struct {
-	startLine int
-	endLine   int
-	colWidths []int
-}
-
-func detectTableBlocks(lines []string) []tableBlock {
-	var blocks []tableBlock
-	inTable := false
-	var current tableBlock
-
-	for i, line := range lines {
-		isTable := reTableRow.MatchString(line) || reTableSep.MatchString(line)
-		if isTable {
-			if !inTable {
-				inTable = true
-				current = tableBlock{startLine: i + 1}
-			}
-			current.endLine = i + 1
-
-			if !reTableSep.MatchString(line) {
-				cells := parseTableCells(line)
-				for len(current.colWidths) < len(cells) {
-					current.colWidths = append(current.colWidths, 0)
-				}
-				for ci, cell := range cells {
-					if len(cell) > current.colWidths[ci] {
-						current.colWidths[ci] = len(cell)
-					}
-				}
-			}
-		} else {
-			if inTable {
-				blocks = append(blocks, current)
-				inTable = false
-			}
-		}
-	}
-	if inTable {
-		blocks = append(blocks, current)
-	}
-	return blocks
-}
-
-func parseTableCells(line string) []string {
-	line = strings.TrimSpace(line)
-	line = strings.Trim(line, "|")
-	parts := strings.Split(line, "|")
-	cells := make([]string, len(parts))
-	for i, p := range parts {
-		cells[i] = strings.TrimSpace(p)
-	}
-	return cells
-}
-
-func formatTableRow(line string, colWidths []int, isHeader bool) string {
-	cells := parseTableCells(line)
-	pipe := mdTablePipe.Render("│")
-
-	var parts []string
-	for ci := 0; ci < len(colWidths); ci++ {
-		w := colWidths[ci]
-		cell := ""
-		if ci < len(cells) {
-			cell = cells[ci]
-		}
-		padded := lipgloss.NewStyle().Width(w).Render(cell)
-		if isHeader {
-			parts = append(parts, mdTableHeaderStyle.Render(" "+padded+" "))
-		} else {
-			parts = append(parts, mdTableCellStyle.Render(" "+padded+" "))
-		}
-	}
-
-	return pipe + strings.Join(parts, pipe) + pipe
-}
-
-func formatTableSep(colWidths []int) string {
-	pipe := mdTablePipe.Render("│")
-	var parts []string
-	for _, w := range colWidths {
-		parts = append(parts, mdTableSepStyle.Render(strings.Repeat("─", w+2)))
-	}
-	return pipe + strings.Join(parts, mdTablePipe.Render("┼")) + pipe
-}
-
-func highlightInline(line string) string {
-	line = reCode.ReplaceAllStringFunc(line, func(match string) string {
-		inner := match[1 : len(match)-1]
-		return mdCodeStyle.Render(" " + inner + " ")
-	})
-
-	line = reBold.ReplaceAllStringFunc(line, func(match string) string {
-		inner := match[2 : len(match)-2]
-		return mdBoldStyle.Render(inner)
-	})
-
-	line = reItalic.ReplaceAllStringFunc(line, func(match string) string {
-		start := 0
-		end := len(match)
-		if match[0] != '*' {
-			start = 1
-		}
-		if match[end-1] != '*' {
-			end--
-		}
-		inner := match[start+1 : end-1]
-		prefix := match[:start]
-		suffix := match[end:]
-		return prefix + mdItalicStyle.Render(inner) + suffix
-	})
-
-	line = reLink.ReplaceAllStringFunc(line, func(match string) string {
-		idx := strings.Index(match, "](")
-		if idx < 0 {
-			return match
-		}
-		text := match[1:idx]
-		return mdLinkStyle.Render(text)
-	})
-
-	return line
-}
-
-func (m *AppModel) scrollToCursor() {
-	t := m.tab()
-	if t.doc == nil {
-		return
-	}
-
-	renderedLine := 0
-	extraCounts := m.extraLinesPerDocLine()
-	for i := 1; i < t.cursorLine; i++ {
-		renderedLine++
-		renderedLine += extraCounts[i]
-	}
-
-	cursorBottom := renderedLine + 1 + extraCounts[t.cursorLine]
-
-	vpHeight := m.contentViewport.Height()
-	currentTop := m.contentViewport.YOffset()
-
-	if renderedLine < currentTop {
-		m.contentViewport.SetYOffset(renderedLine)
-	}
-	if cursorBottom > currentTop+vpHeight {
-		m.contentViewport.SetYOffset(cursorBottom - vpHeight)
-	}
-}
-
-const chunkScrollPadding = 4
-
-// scrollToChunk scrolls the viewport to show the entire change chunk
-// plus padding lines above and below for context.
-func (m *AppModel) scrollToChunk(chunk changeChunk) {
-	t := m.tab()
-	if t.doc == nil {
-		return
-	}
-
-	extraCounts := m.extraLinesPerDocLine()
-
-	// Compute rendered line for chunk start - padding
-	startLine := chunk.startLine - chunkScrollPadding
-	if startLine < 1 {
-		startLine = 1
-	}
-	startRendered := 0
-	for i := 1; i < startLine; i++ {
-		startRendered++
-		startRendered += extraCounts[i]
-	}
-
-	// Compute rendered line for chunk end + padding
-	endLine := chunk.endLine + chunkScrollPadding
-	if endLine > t.doc.LineCount() {
-		endLine = t.doc.LineCount()
-	}
-	endRendered := 0
-	for i := 1; i <= endLine; i++ {
-		endRendered++
-		endRendered += extraCounts[i]
-	}
-
-	vpHeight := m.contentViewport.Height()
-
-	// If the whole chunk+padding fits, position start at top
-	if endRendered-startRendered <= vpHeight {
-		m.contentViewport.SetYOffset(startRendered)
-	} else {
-		// Chunk is taller than viewport — just put cursor near top with padding
-		m.contentViewport.SetYOffset(startRendered)
-	}
-}
-
-func (m *AppModel) scrollToAnnotation(startLine, endLine int) {
-	t := m.tab()
-	if t.doc == nil {
-		return
-	}
-	if endLine == 0 {
-		endLine = startLine
-	}
-
-	extraCounts := m.extraLinesPerDocLine()
-
-	startRendered := 0
-	for i := 1; i < startLine; i++ {
-		startRendered++
-		startRendered += extraCounts[i]
-	}
-
-	endRendered := 0
-	for i := 1; i <= endLine; i++ {
-		endRendered++
-		endRendered += extraCounts[i]
-	}
-
-	vpHeight := m.contentViewport.Height()
-
-	offset := endRendered - vpHeight
-	if offset < 0 {
-		offset = 0
-	}
-	if offset > startRendered {
-		offset = startRendered
-	}
-
-	m.contentViewport.SetYOffset(offset)
-}
-
-func (m *AppModel) extraLinesPerDocLine() map[int]int {
-	t := m.tab()
-	counts := make(map[int]int)
-	if t.doc == nil {
-		return counts
-	}
-
-	contentWidth := m.contentViewport.Width()
-	textWidth := contentWidth - 8
-	if textWidth < 10 {
-		textWidth = 10
-	}
-
-	for i, line := range t.doc.Lines {
-		lineNum := i + 1
-		wrapped := lipgloss.Wrap(line, textWidth, "")
-		wrapCount := strings.Count(wrapped, "\n")
-		if wrapCount > 0 {
-			counts[lineNum] += wrapCount
-		}
-	}
-
-	if t.state != nil {
-		for _, c := range t.state.Comments {
-			endAt := c.Line
-			if c.EndLine > 0 {
-				endAt = c.EndLine
-			}
-			bodyLines := strings.Count(c.Body, "\n") + 1
-			counts[endAt] += bodyLines + 3
-		}
-	}
-
-	// Account for deleted lines rendered before each doc line
-	if t.deletedAfter != nil {
-		for afterLine, dels := range t.deletedAfter {
-			targetLine := afterLine + 1
-			if targetLine < 1 {
-				targetLine = 1
-			}
-			counts[targetLine] += len(dels)
-		}
-	}
-
-	return counts
 }
 
 func (m *AppModel) updateCommentSidebar() {
+	m.syncFileTree()
+	if len(m.tabs) == 0 {
+		m.commentViewport.SetContent("")
+		return
+	}
 	t := m.tab()
 	if t.state == nil {
 		return
 	}
+	m.sidebarTargets = nil
+	m.sidebarActions = nil
 
 	t.sidebarItems = nil
 	for _, c := range t.state.Comments {
 		t.sidebarItems = append(t.sidebarItems, sidebarItem{
-			id: c.ID, line: c.Line, endLine: c.EndLine,
-			body: c.Body,
+			id: c.ID, scope: c.Scope, line: c.StartLine, endLine: c.EndLine, drifted: commentDrifted(t, c),
+			side: c.Side, body: c.Body, author: c.Author, replies: c.Replies,
+			resolved: c.Resolved, resolvedRound: c.ResolvedRound,
 		})
 	}
-	sort.Slice(t.sidebarItems, func(i, j int) bool { return t.sidebarItems[i].line < t.sidebarItems[j].line })
+	sort.SliceStable(t.sidebarItems, func(i, j int) bool {
+		if isGeneralCommentScope(t.sidebarItems[i].scope) {
+			if !isGeneralCommentScope(t.sidebarItems[j].scope) {
+				return true
+			}
+			return !t.sidebarItems[i].resolved && t.sidebarItems[j].resolved
+		}
+		if isGeneralCommentScope(t.sidebarItems[j].scope) {
+			return false
+		}
+		return t.sidebarItems[i].line < t.sidebarItems[j].line
+	})
 
 	if t.sidebarCursor >= len(t.sidebarItems) {
 		t.sidebarCursor = len(t.sidebarItems) - 1
@@ -1489,252 +2397,1527 @@ func (m *AppModel) updateCommentSidebar() {
 	if t.sidebarCursor < 0 {
 		t.sidebarCursor = 0
 	}
+	if m.hideComments {
+		m.commentViewport.SetContent("")
+		return
+	}
 
 	var b strings.Builder
 
 	if len(t.sidebarItems) == 0 {
-		b.WriteString(commentStyle.Render("No comments yet.\n\nPress enter to comment.\n\nUse 'v' to select\nmultiple lines first."))
+		message := "No comments yet.\n\nPress RET for a line comment,\nor 'f' for a file comment."
+		if len(t.state.Comments) > 0 {
+			message = "All comments resolved."
+		}
+		b.WriteString(commentStyle.Render(message))
 		m.commentViewport.SetContent(b.String())
 		return
 	}
 
 	for idx, it := range t.sidebarItems {
 		isSelected := m.focused == commentPane && idx == t.sidebarCursor
+		collapsed := m.collapseResolved(it.resolved, it.resolvedRound) && !isSelected
+		if it.drifted {
+			collapsed = (!m.driftedExpanded(it.id, it.resolved) || (m.foldResolved && it.resolved)) && (!isSelected || !it.resolved)
+		}
+		var item strings.Builder
 
 		var lineInfo string
-		if it.endLine > 0 {
+		if isGeneralCommentScope(it.scope) {
+			lineInfo = "File"
+			if it.scope == "review" {
+				lineInfo = "Review"
+			}
+		} else if it.endLine > it.line {
 			lineInfo = fmt.Sprintf("L%d-%d", it.line, it.endLine)
 		} else {
 			lineInfo = fmt.Sprintf("L%d", it.line)
 		}
-		lineInfo = commentLineStyle.Render(lineInfo)
-
+		if it.side == "old" {
+			lineInfo += " (deleted)"
+		}
+		if it.drifted {
+			lineInfo += " (drifted)"
+		}
+		lineInfo = commentLineStyle.Foreground(lipgloss.Cyan).Render(lineInfo)
+		if len(it.replies) > 0 {
+			lineInfo += commentLineStyle.Render(" · ") + inlineLabelComment.Bold(false).Render(countNoun(len(it.replies), "reply", "replies"))
+		}
 		cursorCol := lipgloss.NewStyle().Width(2)
 		prefix := cursorCol.Render("")
 		if isSelected {
 			prefix = cursorCol.Render(cursorMarker.Render(">"))
 		}
+		header, button := renderCommentHeader(prefix+lineInfo, it.resolved, m.canDeleteComment(it.id), max(1, m.commentViewport.Width()))
+		button.translate(0, len(m.sidebarTargets))
+		button.id = it.id
+		m.sidebarActions = append(m.sidebarActions, button)
 
-		b.WriteString(fmt.Sprintf("%s%s\n", prefix, lineInfo))
-
-		clamped := clampLines(it.body, 3)
-		bodyLines := strings.Split(clamped, "\n")
-		for i, bl := range bodyLines {
-			styled := bl
-			if isSelected {
-				styled = sidebarSelectedText.Render(bl)
-			} else {
-				styled = commentStyle.Render(bl)
+		if collapsed {
+			item.WriteString(header)
+			wrapped := lipgloss.Wrap(expandDisplayTabs(item.String()), max(m.commentViewport.Width(), 1), "")
+			for _, row := range strings.Split(wrapped, "\n") {
+				b.WriteString(row)
+				b.WriteByte('\n')
+				m.sidebarTargets = append(m.sidebarTargets, idx)
 			}
-			b.WriteString(" " + styled)
-			if i < len(bodyLines)-1 {
-				b.WriteString("\n")
-			}
+			b.WriteByte('\n')
+			m.sidebarTargets = append(m.sidebarTargets, idx)
+			continue
 		}
-		b.WriteString("\n\n")
+
+		fmt.Fprintf(&item, "%s\n", header)
+
+		thread := m.renderThread(threadViewKey{id: it.id, sidebar: true}, it.author, it.body, it.replies,
+			max(1, m.commentViewport.Width()-1), isSelected)
+		item.WriteString(" " + strings.ReplaceAll(thread, "\n", "\n "))
+
+		wrapped := lipgloss.Wrap(expandDisplayTabs(item.String()), max(m.commentViewport.Width(), 1), "")
+		for _, row := range strings.Split(wrapped, "\n") {
+			b.WriteString(row)
+			b.WriteByte('\n')
+			m.sidebarTargets = append(m.sidebarTargets, idx)
+		}
+		b.WriteByte('\n')
+		m.sidebarTargets = append(m.sidebarTargets, idx)
 	}
 
 	m.commentViewport.SetContent(b.String())
 }
 
+func unresolvedCommentCount(comments []review.Comment) int {
+	count := 0
+	for _, c := range comments {
+		if !c.Resolved {
+			count++
+		}
+	}
+	return count
+}
+
+func truncateLeftToWidth(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	stringWidth := ansi.StringWidth(s)
+	if stringWidth <= width {
+		return s
+	}
+	const prefix = "…"
+	prefixWidth := ansi.StringWidth(prefix)
+	if width <= prefixWidth {
+		return ansi.Truncate(prefix, width, "")
+	}
+	return prefix + ansi.Cut(s, stringWidth-width+prefixWidth, stringWidth)
+}
+
+func (m AppModel) reviewScopeLabel() string {
+	if !m.multiFile || m.filePath != "" {
+		return ""
+	}
+	if m.patch != nil {
+		return "Supplied diff"
+	}
+	if m.source != nil {
+		switch m.source.Scope {
+		case "all":
+			return "All"
+		case "staged":
+			return "Staged"
+		case "unstaged":
+			return "Unstaged"
+		case "range":
+			return "Range: " + m.source.Range
+		}
+	}
+	if m.staged {
+		return "Staged"
+	}
+	if m.baseRef == "" || m.baseRef == "HEAD" {
+		return "Working tree"
+	}
+	return "Base: " + m.baseRef
+}
+
+func (m AppModel) renderHeader() string {
+	header, _ := m.renderHeaderWithProgress()
+	return header
+}
+
+func (m AppModel) renderHeaderWithProgress() (string, []progressRegion) {
+	t := m.tab()
+	displayPath := t.displayPath()
+	if t.attachment != nil {
+		displayPath = t.attachment.Source
+		if t.attachment.Removed {
+			displayPath += " (removed attachment)"
+		}
+	} else if m.filePath != "" && t.path != overallCommentsPath {
+		displayPath = m.filePath
+	}
+
+	prefix := " "
+	var suffix string
+	if t.selecting {
+		start, end := m.selectionRange()
+		selLabel := visualModeIndicator.Render("VISUAL")
+		deleted := ""
+		if m.selectionSide() == "old" {
+			deleted = " (deleted)"
+		}
+		suffix = fmt.Sprintf("  %s L%d-%d%s", selLabel, start, end, deleted)
+	} else if t.doc != nil {
+		var position string
+		if t.cursorSide == "old" {
+			position = fmt.Sprintf("L%d (deleted)", t.cursorLine)
+		} else {
+			position = fmt.Sprintf("L%d/%d", t.cursorLine, t.doc.LineCount())
+		}
+		suffix = " " + headerPathStyle.Foreground(lipgloss.Cyan).Render(position)
+	}
+	headerWidth := max(0, m.width-headerStyle.GetHorizontalFrameSize())
+	progress, regions := m.layoutProgressCounts(0, 0, -1)
+	progress = " " + progress
+	for i := range regions {
+		regions[i].rect.left++
+		regions[i].rect.right++
+	}
+	wrapProgress := m.width > 0 && ansi.StringWidth(prefix+suffix)+3+ansi.StringWidth(progress) > headerWidth
+	if t.selecting {
+		progress, regions = "", nil
+	}
+	progressWidth := 0
+	if progress != "" && !wrapProgress {
+		progressWidth = 3 + ansi.StringWidth(progress)
+	}
+	if m.width > 0 {
+		pathWidth := max(0, headerWidth-ansi.StringWidth(prefix)-ansi.StringWidth(suffix)-progressWidth)
+		displayPath = truncateLeftToWidth(displayPath, pathWidth)
+	}
+	headerContent := prefix + inlineBackground(headerPathStyle, headerPathStyle.Render(displayPath+suffix))
+	progressLeft, progressTop := ansi.StringWidth(headerContent)+3, 0
+	if progress != "" {
+		if wrapProgress {
+			progress, regions = m.layoutProgressCounts(max(1, headerWidth-1), 0, -1)
+			lines := strings.Split(progress, "\n")
+			for i, line := range lines {
+				padding := max(0, headerWidth-1-ansi.StringWidth(line))
+				lines[i] = strings.Repeat(" ", padding) + inlineBackground(lipgloss.NewStyle().Background(buttonBackground), " "+line)
+				for j := range regions {
+					if regions[j].rect.top == i {
+						regions[j].rect.left += padding + 1
+						regions[j].rect.right += padding + 1
+					}
+				}
+			}
+			progress = strings.Join(lines, "\n")
+			headerContent += "\n"
+			progressLeft, progressTop = 0, 1
+		} else {
+			headerContent += "   "
+			if m.width > 0 {
+				progressLeft = headerWidth - ansi.StringWidth(progress)
+				headerContent += strings.Repeat(" ", max(0, progressLeft-ansi.StringWidth(headerContent)))
+			}
+			progress = inlineBackground(lipgloss.NewStyle().Background(buttonBackground), progress)
+		}
+		headerContent += progress
+	}
+	if m.width > 0 {
+		lines := strings.Split(headerContent, "\n")
+		for i := range lines {
+			lines[i] = ansi.Truncate(lines[i], headerWidth, "")
+		}
+		headerContent = strings.Join(lines, "\n")
+	}
+	bar := m.renderReviewBar()
+	for i := range regions {
+		regions[i].rect.left += progressLeft + headerStyle.GetPaddingLeft()
+		regions[i].rect.right += progressLeft + headerStyle.GetPaddingLeft()
+		regions[i].rect.top += lipgloss.Height(bar) + progressTop + headerStyle.GetPaddingTop()
+		regions[i].rect.bottom += lipgloss.Height(bar) + progressTop + headerStyle.GetPaddingTop()
+	}
+	return bar + "\n" + inlineBackground(headerStyle, headerStyle.Width(m.width).Render(headerContent)), regions
+}
+
+// renderReviewBar renders the top bar: what is under review, the review-wide
+// toggles, and a right-aligned Submit button.  The parts are styled one by
+// one so the bar's background resumes after each embedded style.
+func (m AppModel) renderReviewBar() string {
+	scope, subject := m.reviewSubject()
+	if m.host != "" {
+		subject += " on " + m.host
+	}
+	subject += "."
+	text := renderBrand() + reviewBarStyle.Render(" ")
+	if m.project != "" {
+		text += reviewBarStyle.Bold(true).Render(headerLabel(m.project))
+		if m.topic != "" {
+			text += reviewBarStyle.Render(" · " + headerLabel(m.topic))
+		}
+		text += reviewBarStyle.Render(" — ")
+	} else if m.topic != "" {
+		text += reviewBarStyle.Render(headerLabel(m.topic) + " — ")
+	}
+	text += reviewBarStyle.Render("review the ")
+	if style, ok := scopeWordStyle(scope); ok {
+		text += style.Render(scope) + reviewBarStyle.Render(" ")
+	}
+	text += reviewBarStyle.Render(subject)
+	button := m.submitButton()
+	right := button + reviewBarStyle.Render(" ")
+	if search := m.searchButton(); search != "" {
+		right = search + reviewBarStyle.Render(" ") + right
+	}
+	if m.ignoreWhitespace {
+		right = reviewBarStyle.Render("[WS: ignored] ") + right
+	}
+	if m.width <= 0 {
+		return text + reviewBarStyle.Render(" ") + right
+	}
+	available := m.width - lipgloss.Width(right) - 1
+	if available < 0 {
+		return ansi.Truncate(right, m.width, "")
+	}
+	if lipgloss.Width(text) > available {
+		text = ansi.Truncate(text, max(0, available-1), "")
+		if available > 0 {
+			text += reviewBarStyle.Render("…")
+		}
+	}
+	gap := m.width - lipgloss.Width(text) - lipgloss.Width(right)
+	return text + reviewBarStyle.Render(strings.Repeat(" ", gap)) + right
+}
+
+func headerLabel(value string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, ansi.Strip(value))
+}
+
+// submitButton renders the button that opens the finish dialog.
+func (m AppModel) submitButton() string {
+	return renderBarButton("Submit", "q")
+}
+
+// scopeWordStyle styles the scope word in the top bar: white on the
+// inline-change background of the matching diff side, which follows the
+// terminal's light or dark theme.  Other scopes have no word.
+func scopeWordStyle(scope string) (lipgloss.Style, bool) {
+	switch scope {
+	case "staged":
+		return diffAddedTextBg.Foreground(lipgloss.BrightWhite), true
+	case "unstaged":
+		return diffDeletedTextBg.Foreground(lipgloss.BrightWhite), true
+	}
+	return lipgloss.Style{}, false
+}
+
+// reviewSubject names what the review covers, for the top bar.  The scope
+// is "staged" or "unstaged" when the review is limited to one of them and
+// empty otherwise.
+func (m AppModel) reviewSubject() (scope, subject string) {
+	if !m.multiFile || m.filePath != "" {
+		return "", "document"
+	}
+	if m.source != nil {
+		scope = m.source.Scope
+	} else if m.staged {
+		scope = "staged"
+	}
+	if _, ok := scopeWordStyle(scope); !ok {
+		scope = ""
+	}
+	if len(m.attachments) > 0 {
+		hasChanges := false
+		for _, tab := range m.tabs {
+			if tab.attachment == nil && !tab.outsideChanges {
+				hasChanges = true
+				break
+			}
+		}
+		if !hasChanges {
+			return scope, "attachments (no file changes)"
+		}
+	}
+	return scope, "changes"
+}
+
 func (m AppModel) View() tea.View {
 	if m.err != nil {
-		v := tea.NewView(fmt.Sprintf("Error: %v\n\nPress q to quit.", m.err))
+		hint := "Press q to quit."
+		if m.finishSaveFailed {
+			hint = "RET: retry saving · ESC: return to review · q: quit without finishing"
+		}
+		v := tea.NewView(fmt.Sprintf("Error: %v\n\n%s", m.err, hint))
 		v.AltScreen = true
 		return v
 	}
 
+	if m.multiFile && len(m.tabs) == 0 && m.width > 0 {
+		body, regions := m.renderEmptyReview()
+		v := tea.NewView(body)
+		v.AltScreen = true
+		v.MouseMode = tea.MouseModeAllMotion
+		m.placeModalCursor(&v, regions)
+		return v
+	}
 	if m.width == 0 || len(m.tabs) == 0 || m.tab().state == nil {
 		v := tea.NewView("Loading...")
 		v.AltScreen = true
 		return v
 	}
+	full, layout := m.renderReviewScreen()
 
+	v := tea.NewView(full)
+	v.AltScreen = true
+	v.MouseMode = tea.MouseModeAllMotion
+	if c := layout.isearchCursor; c != nil && c.X >= 0 && c.X < m.width && c.Y >= 0 && c.Y < m.height {
+		v.Cursor = c
+	}
+	m.placeModalCursor(&v, layout.modalRegions)
+	return v
+}
+
+func (m AppModel) placeModalCursor(v *tea.View, regions []modalMouseRegion) {
+	cursor := m.editorCursor()
+	switch m.modal {
+	case gotoLineModal:
+		cursor = m.lineInput.Cursor()
+	case fileSelectModal:
+		cursor = m.fileSelect.input.Cursor()
+	}
+	if c := cursor; c != nil {
+		for _, region := range regions {
+			if !region.action.textarea && !region.action.lineInput {
+				continue
+			}
+			c.X += region.rect.left
+			c.Y += region.rect.top
+			if c.X >= max(0, region.rect.left) && c.X < min(m.width, region.rect.right) &&
+				c.Y >= max(0, region.rect.top) && c.Y < min(m.height, region.rect.bottom) {
+				v.Cursor = c
+			}
+			break
+		}
+	}
+}
+
+func (m AppModel) renderReviewScreen() (string, renderedScreenLayout) {
 	t := m.tab()
 
-	// Header
-	commentCount := len(t.state.Comments)
-	displayPath := t.path
-	if m.filePath != "" {
-		displayPath = m.filePath
-	}
-	var headerContent string
-	if t.selecting {
-		start, end := m.selectionRange()
-		selLabel := visualModeIndicator.Render("VISUAL")
-		headerContent = fmt.Sprintf(" Crit: %s  %s L%d-%d", displayPath, selLabel, start, end)
-	} else if t.doc != nil {
-		headerContent = fmt.Sprintf(" Crit: %s  %d comments  L%d/%d", displayPath, commentCount, t.cursorLine, t.doc.LineCount())
-	} else {
-		headerContent = fmt.Sprintf(" Crit: %s  %d comments", displayPath, commentCount)
-	}
-	var header string
-	if m.detached {
-		claudeBanner := claudeStatusBar.Width(m.width).Render(" Claude Code is paused — review the document, then press q to submit")
-		header = claudeBanner + "\n" + headerStyle.Width(m.width).Render(headerContent)
-	} else {
-		header = headerStyle.Width(m.width).Render(headerContent)
-	}
+	header, progressRegions := m.renderHeaderWithProgress()
 
-	// Tab bar (multi-file mode)
-	var tabBar string
-	if m.multiFile {
-		tabBar = m.renderTabBar()
+	content := m.contentViewport.View()
+	if m.modal != noModal {
+		content = hideImagePlaceholders(content)
 	}
-
-	// Content pane
-	commentWidth := m.width / 4
-	if commentWidth < 20 {
-		commentWidth = 20
-	}
-	contentWidth := m.width - commentWidth
-
-	panelHeight := m.contentViewport.Height()
-
 	contentBox := lipgloss.NewStyle().
-		Width(contentWidth).
-		Height(panelHeight).
-		Render(m.contentViewport.View())
-
-	// Comment sidebar (left border to separate from content)
-	sidebarBorderColor := subtle
-	if m.focused == commentPane {
-		sidebarBorderColor = accent
+		Width(m.contentViewport.Width()).
+		Height(m.contentViewport.Height()).
+		Render(content)
+	if m.hideComments {
+		contentBox = lipgloss.JoinHorizontal(lipgloss.Top, contentBox, m.renderCommentGutter())
 	}
-	sidebarBorder := lipgloss.Border{Left: "│"}
-	commentHeader := lipgloss.NewStyle().Bold(true).Foreground(accent).Render(fmt.Sprintf("Comments (%d)", commentCount))
-	commentBox := lipgloss.NewStyle().
-		Border(sidebarBorder, false, false, false, true).
-		BorderForeground(sidebarBorderColor).
-		Width(commentWidth - 2).
-		Height(panelHeight).
-		PaddingLeft(1).
-		Render(commentHeader + "\n" + m.commentViewport.View())
+	contentPane := renderPane(m.renderTabBar(), contentBox, lipgloss.RoundedBorder(), lipgloss.NewStyle().Foreground(accent))
 
-	mainRow := lipgloss.JoinHorizontal(lipgloss.Top, contentBox, commentBox)
-
-	// Wrap content in a frame: │ left/right borders, ╰───╯ bottom.
-	// The tab bar serves as the top border.
-	if m.multiFile {
-		borderColor := lipgloss.NewStyle().Foreground(accent)
-		lines := strings.Split(mainRow, "\n")
-		var framed strings.Builder
-		left := borderColor.Render("│")
-		right := borderColor.Render("│")
-		for _, line := range lines {
-			framed.WriteString(left + line + right + "\n")
-		}
-		bottom := borderColor.Render("╰" + strings.Repeat("─", m.width-2) + "╯")
-		framed.WriteString(bottom)
-		mainRow = framed.String()
+	mainRow := contentPane
+	if !m.hideComments {
+		mainRow = lipgloss.JoinHorizontal(lipgloss.Top, contentPane, m.renderSidebarPane())
 	}
 
 	footer := m.renderFooter()
 
-	var sections []string
-	sections = append(sections, header)
-	if tabBar != "" {
-		sections = append(sections, tabBar)
+	sections := []string{header, mainRow}
+	footerTop := lipgloss.Height(lipgloss.JoinVertical(lipgloss.Left, sections...))
+	if footer != "" {
+		sections = append(sections, footer)
 	}
-	sections = append(sections, mainRow, footer)
+	layout := renderedScreenLayout{progressRegions: progressRegions}
+	if rect, ok := buttonRect(header, 0, m.searchButton()); ok && m.searchButton() != "" {
+		layout.isearchRegions = append(layout.isearchRegions, isearchMouseRegion{rect: rect, action: isearchStart})
+	}
+	if m.isearch.active && m.modal == noModal {
+		_, x := m.isearchPrompt()
+		layout.isearchCursor = tea.NewCursor(x, footerTop)
+		_, regions := m.isearchControls(footerTop + 1)
+		layout.isearchRegions = append(layout.isearchRegions, regions...)
+		layout.isearchRegions = append(layout.isearchRegions, isearchMouseRegion{
+			rect: mouseRect{left: 0, right: m.width, top: footerTop, bottom: footerTop + 1}, action: isearchInput,
+		})
+	}
+	if !t.selecting {
+		layout.finishButton, layout.hasFinishButton = buttonRect(header, 0, m.submitButton())
+	}
+	layout.footerHelp, layout.hasFooterHelp = buttonRect(footer, footerTop, m.footerHelpButton())
+	layout.imagesButton, layout.hasImagesButton = buttonRect(footer, footerTop, m.imagesButton())
 
 	full := lipgloss.JoinVertical(lipgloss.Left, sections...)
 
 	if m.modal != noModal {
-		full = m.renderWithModal(full)
+		full = hideImagePlaceholders(full)
+		underlyingModal := noModal
+		switch m.modal {
+		case discardChangesModal:
+			underlyingModal = m.discardReturn
+		case deleteConfirmModal:
+			underlyingModal = m.deleteReturn
+		case lightboxModal:
+			underlyingModal = m.lightbox.returnTo
+		}
+		if underlyingModal != noModal {
+			underlying := m
+			underlying.modal = underlyingModal
+			underlying.modalFocus = 0
+			full = hideImagePlaceholders(underlying.renderWithModal(full))
+		}
+		full, layout.modalRegions = m.renderWithModalLayout(full)
 	}
 
-	v := tea.NewView(full)
-	v.AltScreen = true
-	return v
+	return full, layout
+}
+
+type tabLabel struct {
+	text       string
+	rendered   string
+	width      int
+	indicators string
+}
+
+func (m *AppModel) tabLabels() []tabLabel {
+	labels := make([]tabLabel, len(m.tabs))
+	indicators := m.tabFormIndicators()
+	for i, t := range m.tabs {
+		label := abbreviatedTabPath(t.displayPath())
+		start := strings.LastIndexByte(label, '/') + 1
+		filenameStyle := ansi.NewStyle()
+		if i == m.activeTab {
+			filenameStyle = filenameStyle.Bold()
+		}
+		label = label[:start] + filenameStyle.String() + label[start:] + ansi.NewStyle().Normal().Underline(false).String()
+		if counts := t.changeSummary(); counts != "" {
+			label += " " + counts
+		}
+		if t.state != nil && unresolvedCommentCount(t.state.Comments) > 0 {
+			indicators[i] = "💬" + indicators[i]
+		}
+		if indicators[i] != "" {
+			label += " " + indicators[i]
+		}
+		labels[i] = tabLabel{text: label, indicators: indicators[i]}
+	}
+	return labels
+}
+
+func abbreviatedTabPath(path string) string {
+	parts := strings.Split(filepath.ToSlash(path), "/")
+	for i, part := range parts[:len(parts)-1] {
+		for j, r := range part {
+			if unicode.IsLetter(r) || unicode.IsNumber(r) {
+				if end := j + utf8.RuneLen(r); end < len(part) {
+					parts[i] = ansi.NewStyle().Italic(true).String() + part[:end] + ansi.NewStyle().Italic(false).String()
+				}
+				break
+			}
+		}
+	}
+	return strings.Join(parts, "/")
+}
+
+func (m *AppModel) renderTab(labels []tabLabel, i int, isFirst bool) string {
+	style := inactiveTabStyle
+	if i == m.activeTab {
+		style = activeTabStyle
+	}
+	border, _, _, _, _ := style.GetBorder()
+	if isFirst && i == m.activeTab {
+		border.BottomLeft = "│"
+	} else if isFirst {
+		border.BottomLeft = "├"
+	}
+	label := labels[i].text
+	paneWidth := m.contentPaneWidth()
+	total := 0
+	for _, label := range labels {
+		total += ansi.StringWidth(label.text) + style.GetHorizontalFrameSize()
+	}
+	if total > paneWidth {
+		if m.activeTab > 0 {
+			paneWidth -= lipgloss.Width(m.renderTabOverflowIndicator(m.tabOverflowText(m.activeTab, true), false))
+		}
+		if m.activeTab < len(labels)-1 {
+			paneWidth -= lipgloss.Width(m.renderTabOverflowIndicator(m.tabOverflowText(len(labels)-m.activeTab-1, false), false))
+		}
+	}
+	available := max(1, paneWidth-style.GetHorizontalFrameSize())
+	if m.width > 0 && ansi.StringWidth(label) > available {
+		suffix := ""
+		if labels[i].indicators != "" {
+			suffix = " " + labels[i].indicators
+		}
+		label = ansi.Truncate(label, max(0, available-ansi.StringWidth(suffix)), "…") + suffix
+	}
+	return style.Border(border).Render(label)
+}
+
+func (m *AppModel) renderTabOverflowIndicator(text string, isFirst bool) string {
+	style := inactiveTabStyle.Foreground(subtle)
+	if m.contentPaneWidth() < 32 {
+		style = style.Padding(0)
+	}
+	border, _, _, _, _ := style.GetBorder()
+	if isFirst {
+		border.BottomLeft = "├"
+	}
+	return style.Border(border).Render(text)
+}
+
+func (m *AppModel) tabOverflowText(count int, backwards bool) string {
+	if m.contentPaneWidth() < 32 {
+		if backwards {
+			return "↤"
+		}
+		return "↦"
+	}
+	if backwards {
+		return fmt.Sprintf("↤ %d more", count)
+	}
+	return fmt.Sprintf("%d more ↦", count)
+}
+
+func (m *AppModel) visibleTabWindow(labels []tabLabel) (int, int) {
+	totalWidth := 0
+	for _, label := range labels {
+		totalWidth += label.width
+	}
+	paneWidth := m.contentPaneWidth()
+	if totalWidth <= paneWidth {
+		return 0, len(labels)
+	}
+
+	indicatorWidth := func(text string) int {
+		return lipgloss.Width(m.renderTabOverflowIndicator(text, false))
+	}
+	leftWidth, rightWidth := 0, 0
+	if m.activeTab > 0 {
+		leftWidth = indicatorWidth(m.tabOverflowText(m.activeTab, true))
+	}
+	if m.activeTab < len(labels)-1 {
+		rightWidth = indicatorWidth(m.tabOverflowText(len(labels)-m.activeTab-1, false))
+	}
+
+	available := paneWidth - leftWidth - rightWidth
+	start, end := m.activeTab, m.activeTab+1
+	used := labels[m.activeTab].width
+	for {
+		expanded := false
+		if start > 0 && used+labels[start-1].width <= available {
+			start--
+			used += labels[start].width
+			expanded = true
+		}
+		if end < len(labels) && used+labels[end].width <= available {
+			used += labels[end].width
+			end++
+			expanded = true
+		}
+		if !expanded {
+			return start, end
+		}
+	}
+}
+
+func (m *AppModel) handleMouseClick(msg tea.MouseClickMsg) (tea.Model, tea.Cmd) {
+	mouse := msg.Mouse()
+	if mouse.Button != tea.MouseLeft {
+		return m, nil
+	}
+	// A double-click that opens a dialog must not activate the control
+	// newly placed beneath the pointer on its second click.
+	if m.modal != noModal && mouse.X == m.modalOpeningClick.X && mouse.Y == m.modalOpeningClick.Y &&
+		time.Since(m.modalOpenedAt) < 500*time.Millisecond {
+		return m, nil
+	}
+	previousModal := m.modal
+	defer func() {
+		if previousModal != m.modal && m.modal != noModal {
+			m.modalOpenedAt = time.Now()
+			m.modalOpeningClick = mouse
+		}
+	}()
+	if len(m.tabs) == 0 {
+		return m.handleEmptyReviewClick(msg)
+	}
+	m.hoveredGutterLine = 0
+	m.hoveredGutterSide = ""
+	if m.modal != noModal && m.clickedModalDismiss(mouse) {
+		return m.handleKeyPress(tea.KeyPressMsg{Code: tea.KeyEscape})
+	}
+	if m.modal == gotoLineModal || m.modal == openSourceModal {
+		return m.handleLocationModalMouse(mouse)
+	}
+	if m.modal == fileSelectModal {
+		return m.handleFileSelectMouse(mouse)
+	}
+	if m.modal == helpModal {
+		for _, region := range m.modalMouseRegions() {
+			if region.action.scrollable && region.rect.contains(mouse) {
+				m.scrollHelp(region.action.scrollOffset)
+				break
+			}
+		}
+		return m, nil
+	}
+	if m.modal == finishResolveModal || m.modal == finishAbortModal {
+		return m.handleFinishConfirmationMouse(mouse)
+	}
+	if m.modal == finishFormsModal {
+		return m.handleFinishFormsMouse(mouse)
+	}
+	if m.modal == finishModal {
+		return m.handleFinishModalMouse(mouse)
+	}
+	if m.modal == lightboxModal {
+		return m.handleLightboxMouse(mouse)
+	}
+	if m.isTextModal() {
+		if cmd, ok := m.openImageLink(m.referenceAt(mouse.X, mouse.Y)); ok {
+			return m, cmd
+		}
+		return m.handleTextModalMouse(mouse)
+	}
+	if m.modal == discardChangesModal {
+		return m.handleDiscardChangesModalMouse(mouse)
+	}
+	if m.modal == deleteConfirmModal {
+		return m.handleDeleteConfirmModalMouse(mouse)
+	}
+	if m.modal != noModal {
+		return m, nil
+	}
+	if !m.tab().selecting {
+		uri := m.referenceAt(mouse.X, mouse.Y)
+		if m.navigateCommentReference(uri) {
+			return m, nil
+		}
+		if location, ok := sourceLink(uri); ok && regularFile(m.sourcePath(location.path)) {
+			return m, m.navigateSource(location)
+		}
+		if cmd, ok := m.openImageLink(uri); ok {
+			return m, cmd
+		}
+	}
+	if rect, ok := m.finishButtonRect(); ok && rect.contains(mouse) {
+		m.openFinishModal()
+		return m, nil
+	}
+	if rect, ok := m.footerHelpRect(); ok && rect.contains(mouse) {
+		m.helpOffset = 0
+		m.modal = helpModal
+		return m, nil
+	}
+	_, imageLayout := m.renderReviewScreen()
+	for _, region := range imageLayout.progressRegions {
+		if region.rect.contains(mouse) {
+			m.jumpToProgress(region.kind)
+			return m, nil
+		}
+	}
+	if imageLayout.hasImagesButton && imageLayout.imagesButton.contains(mouse) {
+		cmd := m.toggleImages()
+		return m, cmd
+	}
+
+	headerHeight := m.headerHeight()
+	if mouse.Y >= headerHeight && mouse.Y < headerHeight+m.tabBarHeight() {
+		if view, ok := m.sidebarTabAt(mouse.X); ok {
+			m.sidebarView = view
+			m.focused = commentPane
+			m.updateCommentSidebar()
+			m.rebuildContent()
+			return m, nil
+		}
+		labels := m.tabLabels()
+		for i := range labels {
+			labels[i].rendered = m.renderTab(labels, i, i == 0)
+			labels[i].width = lipgloss.Width(labels[i].rendered)
+		}
+		start, end := m.visibleTabWindow(labels)
+		x := 0
+		if start > 0 {
+			indicator := m.renderTabOverflowIndicator(m.tabOverflowText(start, true), true)
+			width := lipgloss.Width(indicator)
+			if mouse.X >= x && mouse.X < x+width {
+				m.selectTab(start - 1)
+				return m, nil
+			}
+			x += width
+		}
+		for i := start; i < end; i++ {
+			if mouse.X >= x && mouse.X < x+labels[i].width {
+				m.selectTab(i)
+				return m, nil
+			}
+			x += labels[i].width
+		}
+		if end < len(labels) {
+			indicator := m.renderTabOverflowIndicator(m.tabOverflowText(len(labels)-end, false), false)
+			if mouse.X >= x && mouse.X < x+lipgloss.Width(indicator) {
+				m.selectTab(end)
+				return m, nil
+			}
+		}
+		return m, nil
+	}
+
+	left, top, right, bottom := m.contentBounds()
+	if mouse.X >= left && mouse.X < right && mouse.Y >= top && mouse.Y < bottom {
+		if !m.tab().selecting {
+			point := tea.Mouse{X: mouse.X - left, Y: mouse.Y - top + m.contentViewport.YOffset()}
+			for _, control := range m.contentLayout.formControls {
+				if control.rect.contains(point) {
+					m.focused = contentPane
+					m.tab().cursorLine, m.tab().cursorSide, m.tab().cursorOnAnnotation = control.line, "", false
+					m.tab().cursorOnForm = true
+					m.toggleForm(control.line)
+					return m, nil
+				}
+			}
+			for _, marker := range m.contentLayout.markers {
+				if marker.rect.contains(point) {
+					m.selectMarker(marker.ids)
+					return m, nil
+				}
+			}
+		}
+		wasFocused := m.focused == contentPane
+		m.focused = contentPane
+		if target, ok := m.contentMouseTarget(mouse.Y - top + m.contentViewport.YOffset()); ok {
+			t := m.tab()
+			if mouse.X == left && !target.annotation && t.selecting {
+				start, end := m.selectionRange()
+				if start < end && target.side == t.selectSide && target.line == end {
+					m.openLineComment()
+					m.rebuildContent()
+					return m, nil
+				}
+			}
+			openThread := wasFocused && target.annotation && t.cursorOnAnnotation &&
+				t.cursorLine == target.line && t.cursorSide == target.side && t.cursorAnnoIdx == target.annotationIndex
+			t.cursorLine, t.cursorSide = target.line, target.side
+			t.cursorOnAnnotation = target.annotation
+			t.cursorOnForm = false
+			t.cursorAnnoIdx = target.annotationIndex
+			if !t.selecting && target.annotation {
+				point := tea.Mouse{X: mouse.X - left, Y: mouse.Y - top + m.contentViewport.YOffset()}
+				for _, region := range m.contentLayout.actions {
+					if m.handleCommentHeaderClick(region, point) {
+						return m, nil
+					}
+				}
+			}
+			if openThread {
+				annotations := m.annotationsAfterLine(target.line, target.side)
+				if target.annotationIndex < len(annotations) {
+					m.openCommentThread(annotations[target.annotationIndex].id)
+					return m, nil
+				}
+			}
+			if mouse.X == left && !target.annotation {
+				t.selecting = true
+				t.selectAnchor = target.line
+				t.selectSide = target.side
+				m.mouseSelecting = true
+			}
+		}
+		m.updateCommentSidebar()
+		m.rebuildContent()
+		return m, nil
+	}
+
+	left, top, right, bottom = m.commentBounds()
+	if mouse.X >= left && mouse.X < right && mouse.Y >= top && mouse.Y < bottom {
+		if m.hideComments {
+			if id := m.gutterComment(mouse.Y - top + m.contentViewport.YOffset()); id != "" {
+				m.openCommentThread(id)
+			}
+			return m, nil
+		}
+		if m.sidebarView == filesView {
+			m.handleFileTreeClick(mouse.Y - top + m.fileTree.viewport.YOffset())
+			m.rebuildContent()
+			return m, nil
+		}
+		wasFocused := m.focused == commentPane
+		m.focused = commentPane
+		row := mouse.Y - top + m.commentViewport.YOffset()
+		if i, ok := m.sidebarMouseTarget(row); ok {
+			t := m.tab()
+			point := tea.Mouse{X: mouse.X - left - paneHorizontalPadding, Y: row}
+			openThread := wasFocused && t.sidebarCursor == i
+			m.selectSidebarItem(i)
+			if !t.selecting {
+				for _, region := range m.sidebarActions {
+					if m.handleCommentHeaderClick(region, point) {
+						return m, nil
+					}
+				}
+			}
+			if openThread {
+				m.openCommentThread(t.sidebarItems[i].id)
+				return m, nil
+			}
+		}
+		m.updateCommentSidebar()
+		m.rebuildContent()
+		m.scrollToSidebarCursor()
+	}
+	return m, nil
+}
+
+func (m *AppModel) handleCommentHeaderClick(region commentHeaderRegion, point tea.Mouse) bool {
+	switch {
+	case region.resolve.contains(point):
+		m.clickResolve(region.id)
+	case region.up.contains(point):
+		m.jumpToComment(-1, true)
+	case region.down.contains(point):
+		m.jumpToCommentOrFinish(1, true)
+	case region.delete.contains(point):
+		m.openCommentDelete(region.id)
+	default:
+		return false
+	}
+	return true
+}
+
+func (m *AppModel) selectTab(index int) {
+	if index < 0 || index >= len(m.tabs) || m.activeTab == index {
+		return
+	}
+	m.activeTab = index
+	m.rebuildContent()
+	m.updateCommentSidebar()
+}
+
+type modalMouseAction struct {
+	resolve         bool
+	openImage       bool
+	dialog          bool // the whole dialog frame
+	close           bool
+	lineInput       bool
+	pick            bool
+	pickIndex       int
+	focus           int
+	deleteIndex     int
+	textarea        bool
+	scrollable      bool
+	scrollOffset    int
+	scrollMaxOffset int
+}
+
+type modalMouseRegion struct {
+	rect   mouseRect
+	action modalMouseAction
+}
+
+type modalButtonSpec struct {
+	rendered string
+	action   modalMouseAction
+}
+
+func (m *AppModel) isTextModal() bool {
+	return m.modal == commentModal || m.modal == fileCommentModal ||
+		m.modal == replyModal || m.modal == editModal || m.modal == finishModal
+}
+
+func (m *AppModel) hasModalResolution() bool {
+	return m.modal == replyModal || (m.modal == editModal && m.editingReplyID != "")
+}
+
+func (m *AppModel) handleTextModalMouse(mouse tea.Mouse) (tea.Model, tea.Cmd) {
+	for _, region := range m.modalMouseRegions() {
+		if !region.rect.contains(mouse) {
+			continue
+		}
+		action := region.action
+		if action.resolve {
+			m.toggleResolve(m.editingID)
+			return m, nil
+		}
+		if action.textarea {
+			m.focusTextareaAt(mouse, region.rect)
+			return m, nil
+		}
+		if action.scrollable {
+			return m, nil
+		}
+		m.modalFocus = action.focus
+		switch {
+		case action.focus == 1:
+			m.modalSubmit()
+		case action.focus == 2:
+			m.closeTextModal()
+		case m.canSuggest() && action.focus == 3:
+			m.insertSuggestion()
+		case m.modal == editModal && action.focus >= m.modalDeleteStartFocus():
+			m.openDeleteConfirmation(action.deleteIndex)
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m *AppModel) focusTextareaAt(mouse tea.Mouse, rect mouseRect) {
+	viewRow := m.editorTextRow(mouse.Y - rect.top)
+	if viewRow < 0 {
+		return
+	}
+	targetRow := m.modalTextarea.ScrollYOffset() + viewRow
+	m.modalTextarea.MoveToBegin()
+	for range targetRow {
+		line, column := m.modalTextarea.Line(), m.modalTextarea.Column()
+		m.modalTextarea.CursorDown()
+		if m.modalTextarea.Line() == line && m.modalTextarea.Column() == column {
+			break
+		}
+	}
+
+	lineInfo := m.modalTextarea.LineInfo()
+	textX := max(0, mouse.X-rect.left-lipgloss.Width(m.modalTextarea.Prompt))
+	lines := strings.Split(m.modalTextarea.Value(), "\n")
+	line := []rune(lines[m.modalTextarea.Line()])
+	column := lineInfo.StartColumn
+	end := min(len(line), lineInfo.StartColumn+lineInfo.Width)
+	for column < end && ansi.StringWidth(string(line[lineInfo.StartColumn:column+1])) <= textX {
+		column++
+	}
+	m.modalTextarea.SetCursorColumn(column)
+	m.modalFocus = 0
+	m.modalTextarea.Focus()
+}
+
+func (m *AppModel) handleDiscardChangesModalMouse(mouse tea.Mouse) (tea.Model, tea.Cmd) {
+	for _, region := range m.modalMouseRegions() {
+		if !region.rect.contains(mouse) {
+			continue
+		}
+		m.modalFocus = region.action.focus
+		if region.action.focus == 0 {
+			m.discardTextModal()
+		} else {
+			m.resumeTextModal()
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m *AppModel) handleDeleteConfirmModalMouse(mouse tea.Mouse) (tea.Model, tea.Cmd) {
+	for _, region := range m.modalMouseRegions() {
+		if !region.rect.contains(mouse) {
+			continue
+		}
+		m.modalFocus = region.action.focus
+		if region.action.focus == 0 {
+			m.confirmDelete()
+		} else {
+			m.cancelDeleteConfirmation()
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m *AppModel) handleMouseMotion(msg tea.MouseMotionMsg) (tea.Model, tea.Cmd) {
+	if len(m.tabs) == 0 {
+		return m, nil
+	}
+	if !m.mouseSelecting {
+		m.updateGutterHover(msg.Mouse())
+		return m, nil
+	}
+	if msg.Mouse().Button != tea.MouseLeft {
+		return m, nil
+	}
+	m.updateMouseSelection(msg.Mouse(), true)
+	return m, nil
+}
+
+func (m *AppModel) updateGutterHover(mouse tea.Mouse) {
+	line := 0
+	side := ""
+	if m.modal == noModal && len(m.tabs) > 0 && m.tab().state != nil {
+		left, top, _, bottom := m.contentBounds()
+		if mouse.X == left && mouse.Y >= top && mouse.Y < bottom {
+			if target, ok := m.contentMouseTarget(mouse.Y - top + m.contentViewport.YOffset()); ok && !target.annotation {
+				line = target.line
+				side = target.side
+			}
+		}
+	}
+	if m.hoveredGutterLine == line && m.hoveredGutterSide == side {
+		return
+	}
+	m.hoveredGutterLine = line
+	m.hoveredGutterSide = side
+	m.rebuildContent()
+}
+
+func (m *AppModel) handleMouseRelease(msg tea.MouseReleaseMsg) (tea.Model, tea.Cmd) {
+	if len(m.tabs) == 0 {
+		return m, nil
+	}
+	if !m.mouseSelecting || msg.Mouse().Button != tea.MouseLeft {
+		return m, nil
+	}
+	m.updateMouseSelection(msg.Mouse(), false)
+	m.mouseSelecting = false
+	t := m.tab()
+	t.selecting = t.cursorLine != t.selectAnchor || t.cursorSide != t.selectSide
+	m.openLineComment()
+	m.rebuildContent()
+	return m, nil
+}
+
+func (m *AppModel) updateMouseSelection(mouse tea.Mouse, autoScroll bool) {
+	_, top, _, bottom := m.contentBounds()
+	viewportY := mouse.Y - top + m.contentViewport.YOffset()
+	if autoScroll && mouse.Y <= top {
+		m.contentViewport.ScrollUp(1)
+		viewportY = m.contentViewport.YOffset()
+	} else if autoScroll && mouse.Y >= bottom-1 {
+		m.contentViewport.ScrollDown(1)
+		viewportY = m.contentViewport.YOffset() + m.contentViewport.Height() - 1
+	} else if mouse.Y < top || mouse.Y >= bottom {
+		return
+	}
+
+	if target, ok := m.contentMouseTarget(viewportY); ok {
+		t := m.tab()
+		if t.selecting && target.side != t.selectSide {
+			return
+		}
+		t.cursorLine, t.cursorSide = target.line, target.side
+		t.cursorOnAnnotation = false
+		t.cursorOnForm = false
+		t.cursorAnnoIdx = 0
+		t.selecting = true
+		m.rebuildContent()
+	}
+}
+
+type contentMouseTarget struct {
+	line            int
+	side            string
+	annotation      bool
+	annotationIndex int
+	drifted         bool
+}
+
+func (m *AppModel) contentMouseTarget(y int) (contentMouseTarget, bool) {
+	if y < 0 || y >= len(m.contentLayout.rows) {
+		return contentMouseTarget{}, false
+	}
+	return m.contentLayout.rows[y], true
+}
+
+func (m *AppModel) highlightedCommentLines() (int, int, string) {
+	t := m.tab()
+	if m.focused == commentPane && len(t.sidebarItems) > 0 && t.sidebarCursor < len(t.sidebarItems) {
+		item := t.sidebarItems[t.sidebarCursor]
+		if item.drifted {
+			return 0, 0, ""
+		}
+		return item.line, max(item.line, item.endLine), item.side
+	}
+	if m.focused == contentPane && t.cursorOnAnnotation {
+		annotations := m.annotationsAfterLine(t.cursorLine, t.cursorSide)
+		if t.cursorAnnoIdx < len(annotations) {
+			ann := annotations[t.cursorAnnoIdx]
+			if ann.drifted {
+				return 0, 0, ""
+			}
+			return ann.line, max(ann.line, ann.endLine), ann.side
+		}
+	}
+	return 0, 0, ""
+}
+
+func (m AppModel) commentPanelWidth() int {
+	if m.hideComments {
+		return 4
+	}
+	return max(m.width/4, 26) // room for the Comments and Files tabs
+}
+
+func (m AppModel) gutterComment(row int) string {
+	if m.tab().state == nil || row < 0 || row >= len(m.contentLayout.rows) {
+		return ""
+	}
+	target := m.contentLayout.rows[row]
+	if target.line <= 0 {
+		return ""
+	}
+	if row+1 < len(m.contentLayout.rows) {
+		next := m.contentLayout.rows[row+1]
+		if next.line == target.line && next.side == target.side {
+			return ""
+		}
+	}
+	for _, c := range m.tab().state.Comments {
+		if !commentDrifted(m.tab(), c) && !isGeneralCommentScope(c.Scope) && c.Side == target.side && c.StartLine <= target.line && target.line <= c.EndLine {
+			return c.ID
+		}
+	}
+	return ""
+}
+
+func (m AppModel) renderCommentGutter() string {
+	rows := make([]string, m.contentViewport.Height())
+	for i := range rows {
+		marker := " "
+		if m.gutterComment(i+m.contentViewport.YOffset()) != "" {
+			marker = "💬"
+		}
+		rows[i] = lipgloss.NewStyle().Width(m.commentPanelWidth()).Align(lipgloss.Center).Render(marker)
+	}
+	return strings.Join(rows, "\n")
+}
+
+// paneHorizontalPadding is the space between a pane's side borders and its body.
+const paneHorizontalPadding = 1
+
+// contentPaneWidth returns the total width of the tabbed content pane,
+// including its borders and the gutter shown while comments are hidden.
+func (m AppModel) contentPaneWidth() int {
+	if m.hideComments {
+		return m.width
+	}
+	return m.width - m.commentPanelWidth()
+}
+
+// renderPane frames body under a tab row: the tab row's bottom edge serves as
+// the top border, and body is wrapped by side borders and a bottom border.
+func renderPane(tabRow, body string, border lipgloss.Border, style lipgloss.Style) string {
+	left, right := style.Render(border.Left), style.Render(border.Right)
+	var b strings.Builder
+	b.WriteString(tabRow)
+	b.WriteByte('\n')
+	for _, line := range strings.Split(body, "\n") {
+		b.WriteString(left + line + right + "\n")
+	}
+	width := lipgloss.Width(tabRow)
+	b.WriteString(style.Render(border.BottomLeft + strings.Repeat(border.Bottom, max(0, width-2)) + border.BottomRight))
+	return b.String()
+}
+
+// commentPaneTabLabel returns the label of the comment pane's tab, truncated
+// to fit the pane.
+// sidebarBorderColor is the sidebar pane's border color for its focus state.
+func (m AppModel) sidebarBorderColor() color.Color {
+	if m.focused == commentPane {
+		return commentFocusedBorderColor
+	}
+	return commentBorderColor
+}
+
+// sidebarTabs renders the sidebar's tabs in order, marking the active view.
+func (m AppModel) sidebarTabs() []string {
+	labels := []string{
+		"Files",
+		fmt.Sprintf("Comments (%d)", unresolvedCommentCount(m.tab().state.Comments)),
+	}
+	fg := m.sidebarBorderColor()
+	tabs := make([]string, len(labels))
+	for i, label := range labels {
+		style := inactiveTabStyle.BorderForeground(fg)
+		if sidebarView(i) == m.sidebarView {
+			style = activeTabStyle.BorderForeground(fg)
+		}
+		border, _, _, _, _ := style.GetBorder()
+		if i == 0 {
+			border.BottomLeft = "├"
+			if sidebarView(i) == m.sidebarView {
+				border.BottomLeft = "│"
+			}
+		}
+		tabs[i] = style.Border(border).Render(label)
+	}
+	return tabs
+}
+
+// sidebarTabAt returns the sidebar view whose tab spans screen column x.
+func (m AppModel) sidebarTabAt(x int) (sidebarView, bool) {
+	if m.hideComments {
+		return 0, false
+	}
+	left := m.contentPaneWidth()
+	for i, tab := range m.sidebarTabs() {
+		right := left + lipgloss.Width(tab)
+		if x >= left && x < right {
+			return sidebarView(i), true
+		}
+		left = right
+	}
+	return 0, false
+}
+
+// renderSidebarPane renders the sidebar as a pane with Comments and Files
+// tabs, matching the height of the content pane.  Focus brightens the
+// border color, as with inline comment boxes.
+func (m AppModel) renderSidebarPane() string {
+	width := m.commentPanelWidth()
+	border := lipgloss.RoundedBorder()
+	line := lipgloss.NewStyle().Foreground(m.sidebarBorderColor())
+	tabRow := fillTabRow(lipgloss.JoinHorizontal(lipgloss.Top, m.sidebarTabs()...), width, border, line)
+	view := m.commentViewport.View()
+	if m.sidebarView == filesView {
+		view = m.fileTree.viewport.View()
+	}
+	body := lipgloss.NewStyle().
+		Width(width-2).
+		Height(m.commentViewport.Height()).
+		Padding(0, paneHorizontalPadding).
+		Render(view)
+	return renderPane(tabRow, body, border, line)
+}
+
+// fillTabRow fits a rendered tab row to width.  A shorter row is extended
+// with the pane's top border ending in the top-right corner; a row that fills
+// the width exactly gets its last corner joined to the pane's right border.
+func fillTabRow(row string, width int, border lipgloss.Border, style lipgloss.Style) string {
+	gap := width - lipgloss.Width(row)
+	if gap < 0 {
+		return row
+	}
+	if gap == 0 {
+		return joinTabRowRight(row, style)
+	}
+	blank := strings.Repeat(" ", gap)
+	filler := style.Render(
+		blank + "\n" + blank + "\n" + strings.Repeat(border.Top, gap-1) + border.TopRight)
+	return lipgloss.JoinHorizontal(lipgloss.Top, row, filler)
+}
+
+// joinTabRowRight replaces the bottom-right corner of the last tab, which
+// points outward, with a glyph that meets the pane's right border below it.
+func joinTabRowRight(row string, style lipgloss.Style) string {
+	lines := strings.Split(row, "\n")
+	bottom := lines[len(lines)-1]
+	corner := "┤"
+	if strings.HasSuffix(ansi.Strip(bottom), activeTabBorder.BottomRight) {
+		corner = "│"
+	}
+	lines[len(lines)-1] = ansi.Cut(bottom, 0, lipgloss.Width(bottom)-1) + style.Render(corner)
+	return strings.Join(lines, "\n")
+}
+
+func (m *AppModel) commentBounds() (left, top, right, bottom int) {
+	_, top, left, bottom = m.contentBounds()
+	if m.hideComments {
+		return left, top, left + m.commentPanelWidth(), bottom
+	}
+	left = m.contentPaneWidth() + 1
+	return left, top, m.width - 1, bottom
+}
+
+func (m *AppModel) sidebarMouseTarget(y int) (int, bool) {
+	if y < 0 || y >= len(m.sidebarTargets) {
+		return 0, false
+	}
+	i := m.sidebarTargets[y]
+	if i < 0 || i >= len(m.tab().sidebarItems) {
+		return 0, false
+	}
+	return i, true
+}
+
+func (m *AppModel) selectSidebarItem(i int) {
+	t := m.tab()
+	item := t.sidebarItems[i]
+	t.sidebarCursor = i
+	if !isGeneralCommentScope(item.scope) {
+		t.cursorLine, t.cursorSide = item.line, item.side
+		t.cursorOnAnnotation = false
+		t.cursorOnForm = false
+		t.cursorAnnoIdx = 0
+		m.scrollToAnnotation(item.side, item.line, item.endLine)
+	}
+}
+
+func (m *AppModel) headerHeight() int {
+	if m.width > 0 && len(m.tabs) > 0 {
+		return lipgloss.Height(m.renderHeader())
+	}
+	return 1
+}
+
+func (m *AppModel) tabBarHeight() int {
+	return lipgloss.Height(m.renderTabBar())
+}
+
+func (m *AppModel) contentBounds() (left, top, right, bottom int) {
+	left = 1 // inside the pane's left border
+	top = m.headerHeight() + m.tabBarHeight()
+	right = left + m.contentViewport.Width()
+	bottom = top + m.contentViewport.Height()
+	return left, top, right, bottom
+}
+
+// finishButtonRect returns the screen rectangle of the Submit button in the
+// top bar.
+func (m *AppModel) finishButtonRect() (mouseRect, bool) {
+	if len(m.tabs) == 0 || m.tab().state == nil || m.tab().selecting {
+		return mouseRect{}, false
+	}
+	_, layout := m.renderReviewScreen()
+	return layout.finishButton, layout.hasFinishButton
+}
+
+func (m *AppModel) footerHelpRect() (mouseRect, bool) {
+	if len(m.tabs) == 0 || m.tab().state == nil {
+		return mouseRect{}, false
+	}
+	_, layout := m.renderReviewScreen()
+	return layout.footerHelp, layout.hasFooterHelp
+}
+
+func (m *AppModel) handleMouseWheel(msg tea.MouseWheelMsg) (tea.Model, tea.Cmd) {
+	if len(m.tabs) == 0 {
+		return m, nil
+	}
+	if m.isTextModal() {
+		return m.handleTextModalWheel(msg.Mouse())
+	}
+	if m.modal == lightboxModal {
+		m.handleLightboxWheel(msg.Mouse())
+		return m, nil
+	}
+	if m.modal == helpModal {
+		switch msg.Mouse().Button {
+		case tea.MouseWheelUp:
+			m.scrollHelp(-3)
+		case tea.MouseWheelDown:
+			m.scrollHelp(3)
+		}
+		return m, nil
+	}
+	if m.modal != noModal {
+		return m, nil
+	}
+	mouse := msg.Mouse()
+	direction := 1
+	if mouse.Button == tea.MouseWheelUp {
+		direction = -1
+	} else if mouse.Button != tea.MouseWheelDown {
+		return m, nil
+	}
+	left, top, right, bottom := m.commentBounds()
+	if !m.hideComments && mouse.X >= left && mouse.X < right && mouse.Y >= top && mouse.Y < bottom {
+		if m.sidebarView == filesView {
+			if direction < 0 {
+				m.fileTree.viewport.ScrollUp(3)
+			} else {
+				m.fileTree.viewport.ScrollDown(3)
+			}
+			return m, nil
+		}
+		if i, ok := m.sidebarMouseTarget(mouse.Y - top + m.commentViewport.YOffset()); ok {
+			m.focused = commentPane
+			m.tab().sidebarCursor = i
+			m.updateCommentSidebar()
+			m.rebuildContent()
+			if m.scrollThread(threadViewKey{id: m.tab().sidebarItems[i].id, sidebar: true}, direction, false) {
+				return m, nil
+			}
+		}
+		if direction < 0 {
+			m.commentViewport.ScrollUp(3)
+		} else {
+			m.commentViewport.ScrollDown(3)
+		}
+		return m, nil
+	}
+	left, top, right, bottom = m.contentBounds()
+	if mouse.X < left || (!m.hideComments && mouse.X >= right) || mouse.Y < top || mouse.Y >= bottom {
+		return m, nil
+	}
+	if target, ok := m.contentMouseTarget(mouse.Y - top + m.contentViewport.YOffset()); ok && target.annotation && mouse.X >= left+gutterWidth {
+		annotations := m.annotationsAfterLine(target.line, target.side)
+		if target.annotationIndex < len(annotations) {
+			m.focused = contentPane
+			t := m.tab()
+			t.cursorLine, t.cursorSide = target.line, target.side
+			t.cursorOnAnnotation, t.cursorAnnoIdx = true, target.annotationIndex
+			m.rebuildContent()
+			m.updateCommentSidebar()
+			if m.scrollThread(threadViewKey{id: annotations[target.annotationIndex].id}, direction, false) {
+				return m, nil
+			}
+		}
+	}
+
+	switch mouse.Button {
+	case tea.MouseWheelUp:
+		m.contentViewport.ScrollUp(m.contentViewport.MouseWheelDelta)
+	case tea.MouseWheelDown:
+		m.contentViewport.ScrollDown(m.contentViewport.MouseWheelDelta)
+	}
+	m.updateGutterHover(mouse)
+	return m, nil
+}
+
+func (m *AppModel) handleTextModalWheel(mouse tea.Mouse) (tea.Model, tea.Cmd) {
+	for _, region := range m.modalMouseRegions() {
+		if !region.rect.contains(mouse) {
+			continue
+		}
+		if region.action.scrollable {
+			switch mouse.Button {
+			case tea.MouseWheelUp:
+				m.modalReferenceOffset = max(0, region.action.scrollOffset-3)
+			case tea.MouseWheelDown:
+				m.modalReferenceOffset = min(region.action.scrollMaxOffset, region.action.scrollOffset+3)
+			}
+			return m, nil
+		}
+		if !region.action.textarea {
+			continue
+		}
+		m.modalFocus = 0
+		m.modalTextarea.Focus()
+		for range 3 {
+			switch mouse.Button {
+			case tea.MouseWheelUp:
+				m.modalTextarea.CursorUp()
+			case tea.MouseWheelDown:
+				m.modalTextarea.CursorDown()
+			}
+		}
+		return m, nil
+	}
+	return m, nil
 }
 
 // renderTabBar renders the tab bar for multi-file mode.
 func (m *AppModel) renderTabBar() string {
-	if m.tabSearching {
-		prompt := tabSearchPromptStyle.Render("/")
-		query := m.tabSearch
-		matchInfo := ""
-		if m.tabSearch != "" {
-			matchInfo = fmt.Sprintf(" (%d matches)", len(m.tabMatches))
-		}
-		return prompt + query + footerStyle.Render(matchInfo)
-	}
-
-	// Disambiguate filenames — use basename unless there are collisions
-	basenames := make(map[string]int)
-	for _, t := range m.tabs {
-		base := filepath.Base(t.path)
-		basenames[base]++
-	}
-
-	type tabLabel struct {
-		text     string
-		rendered string
-		width    int
-	}
-
-	labels := make([]tabLabel, len(m.tabs))
-	for i, t := range m.tabs {
-		label := filepath.Base(t.path)
-		if basenames[label] > 1 {
-			label = t.path
-		}
-		if n := len(t.changedLines); n > 0 {
-			label += " " + tabChangeCount.Render(fmt.Sprintf("(+%d)", n))
-		}
-		labels[i] = tabLabel{text: label}
-	}
-	// Render a single tab with correct border corners for its position.
-	// isFirst adjusts the left corner to connect to the outer frame border.
-	renderTab := func(i int, isFirst bool) string {
-		var style lipgloss.Style
-		isActive := i == m.activeTab
-		if isActive {
-			style = activeTabStyle
-		} else {
-			style = inactiveTabStyle
-		}
-		border, _, _, _, _ := style.GetBorder()
-		if isFirst && isActive {
-			border.BottomLeft = "│"
-		} else if isFirst && !isActive {
-			border.BottomLeft = "├"
-		}
-		style = style.Border(border)
-		return style.Render(labels[i].text)
-	}
+	labels := m.tabLabels()
 	for i := range labels {
-		rendered := renderTab(i, i == 0)
+		rendered := m.renderTab(labels, i, i == 0)
 		labels[i].rendered = rendered
 		labels[i].width = lipgloss.Width(rendered)
 	}
 
-	// addFiller extends the tab bottom border to the full width,
-	// connecting to the outer frame's right border.
 	addFiller := func(row string) string {
-		rowW := lipgloss.Width(row)
-		if rowW >= m.width {
-			return row
-		}
-		// 3 lines matching tab height: empty top, empty middle, ───╮ bottom
-		gap := m.width - rowW
-		topFill := strings.Repeat(" ", gap)
-		midFill := strings.Repeat(" ", gap)
-		botFill := strings.Repeat("─", gap-1) + "╮"
-		filler := lipgloss.NewStyle().Foreground(accent).Render(
-			topFill + "\n" + midFill + "\n" + botFill,
-		)
-		return lipgloss.JoinHorizontal(lipgloss.Top, row, filler)
+		return fillTabRow(row, m.contentPaneWidth(), lipgloss.RoundedBorder(), lipgloss.NewStyle().Foreground(accent))
 	}
 
-	// Check if all tabs fit
-	totalWidth := 0
-	for _, l := range labels {
-		totalWidth += l.width
-	}
-
-	if totalWidth <= m.width {
+	start, end := m.visibleTabWindow(labels)
+	if start == 0 && end == len(labels) {
 		var tabs []string
 		for i := range labels {
 			tabs = append(tabs, labels[i].rendered)
@@ -1743,68 +3926,16 @@ func (m *AppModel) renderTabBar() string {
 		return addFiller(row)
 	}
 
-	// Overflow: show a window of tabs centered on the active tab.
-	// Indicators are styled as bordered tabs to align with the tab row.
-	renderIndicator := func(text string, isFirst bool) string {
-		style := inactiveTabStyle.Foreground(subtle)
-		border, _, _, _, _ := style.GetBorder()
-		if isFirst {
-			border.BottomLeft = "├"
-		}
-		style = style.Border(border)
-		return style.Render(text)
-	}
-
-	leftIndicator := ""
-	rightIndicator := ""
-	leftW := 0
-	rightW := 0
-	// Pre-render indicators to know their width for available space calc
-	if m.activeTab > 0 {
-		leftIndicator = renderIndicator(fmt.Sprintf("↤ %d more", m.activeTab), true)
-		leftW = lipgloss.Width(leftIndicator)
-	}
-	if m.activeTab < len(labels)-1 {
-		rightIndicator = renderIndicator(fmt.Sprintf("%d more ↦", len(labels)-m.activeTab-1), false)
-		rightW = lipgloss.Width(rightIndicator)
-	}
-
-	availWidth := m.width - leftW - rightW
-
-	// Find the window of tabs that fits
-	start := m.activeTab
-	end := m.activeTab + 1
-	used := labels[m.activeTab].width
-
-	// Expand window outward from active tab
-	for {
-		expanded := false
-		if start > 0 && used+labels[start-1].width <= availWidth {
-			start--
-			used += labels[start].width
-			expanded = true
-		}
-		if end < len(labels) && used+labels[end].width <= availWidth {
-			used += labels[end].width
-			end++
-			expanded = true
-		}
-		if !expanded {
-			break
-		}
-	}
-
-	// Re-render indicators with actual counts now that we know the visible window
 	var parts []string
 	if start > 0 {
-		ind := renderIndicator(fmt.Sprintf("↤ %d more", start), true)
+		ind := m.renderTabOverflowIndicator(m.tabOverflowText(start, true), true)
 		parts = append(parts, ind)
 	}
 	for i := start; i < end; i++ {
-		parts = append(parts, renderTab(i, i == start && start == 0))
+		parts = append(parts, m.renderTab(labels, i, i == start && start == 0))
 	}
 	if end < len(labels) {
-		ind := renderIndicator(fmt.Sprintf("%d more ↦", len(labels)-end), false)
+		ind := m.renderTabOverflowIndicator(m.tabOverflowText(len(labels)-end, false), false)
 		parts = append(parts, ind)
 	}
 
@@ -1812,59 +3943,425 @@ func (m *AppModel) renderTabBar() string {
 	return addFiller(row)
 }
 
+// footerMinHeight is the terminal height above which the footer's key hints
+// are shown; shorter terminals keep every row for the review itself.
+const footerMinHeight = 22
+
+// renderFooter renders the key hints and the Help button, or "" when the
+// terminal is too short for them.
 func (m AppModel) renderFooter() string {
+	if m.isearch.active {
+		controls, _ := m.isearchControls(0)
+		return m.renderISearchPrompt() + "\n" + controls
+	}
+	if m.locationError != "" {
+		return footerStyle.Width(m.width).Render(m.locationError)
+	}
+	if m.height < footerMinHeight {
+		return ""
+	}
 	t := m.tabs[m.activeTab]
 	k := func(key, desc string) string {
-		return footerKeyStyle.Render(key) + " " + footerStyle.Render(desc)
+		return footerKeyStyle.Render(keyHintNames.Replace(key)) + " " + footerDescStyle.Render(desc)
 	}
 
 	var items []string
 	if t.selecting {
 		items = []string{
-			k("j/k", "extend"),
 			k("enter", "comment selection"),
 			k("esc", "cancel"),
 			k("v", "toggle select"),
 		}
 	} else {
+		enterAction := "comment"
+		comment, drifted := m.driftedComment(m.selectedCommentID())
+		drifted = drifted && !comment.Resolved
+		if drifted {
+			enterAction = "toggle thread"
+		}
 		items = []string{
-			k("j/k", "move"),
-			k("[/]", "prev/next comment"),
-			k("shift+↑↓", "page"),
+			k("[/]", "threads/forms"),
+			k("{/}", "unresolved"),
 			k("s", "sidebar"),
-			k("v", "select"),
-			k("enter", "comment"),
-			k("q", "save & quit"),
+			k("t", "files/comments"),
+			k("v", "select lines"),
+			k("enter", enterAction),
+			k("f", "file comment"),
+		}
+		if drifted {
+			items = append(items, k("e", "edit/reply"))
+		}
+		if len(t.state.Comments) > 0 {
+			items = append(items, k("r/R", "resolve/+next"))
 		}
 		if m.multiFile {
 			items = append([]string{
 				k("tab/S-tab", "next/prev tab"),
-				k("n/N", "next/prev change"),
+				k("n/N", "change/open/form"),
 			}, items...)
 		}
 	}
+	if row, ok := m.formRows[t.path][t.cursorLine]; ok && row.item != nil && !t.selecting && !t.cursorOnAnnotation && t.cursorSide == "" {
+		items = append([]string{k("space", "answer")}, items...)
+	}
+	items = append([]string{m.footerHelpButton(), m.imagesButton()}, items...)
 
-	return footerStyle.Width(m.width).Render(strings.Join(items, "  "))
+	return footerStyle.Width(m.width).Render(strings.Join(items, " · "))
+}
+
+func (m AppModel) footerHelpButton() string {
+	return renderBarButton("Help", "M-?")
+}
+
+// buttonRect locates a rendered button in a block that starts at screen row
+// top and may span several rows, and returns its screen rectangle.
+func buttonRect(block string, top int, button string) (mouseRect, bool) {
+	plain := ansi.Strip(button)
+	for y, line := range strings.Split(block, "\n") {
+		stripped := ansi.Strip(line)
+		i := strings.Index(stripped, plain)
+		if i < 0 {
+			continue
+		}
+		left := lipgloss.Width(stripped[:i])
+		return mouseRect{left: left, right: left + lipgloss.Width(plain), top: top + y, bottom: top + y + 1}, true
+	}
+	return mouseRect{}, false
+}
+
+type helpItem struct {
+	keys string
+	desc string
+}
+
+func renderHelpGroup(title string, items []helpItem, width int) string {
+	if width < 6 {
+		width = 6
+	}
+	keyWidth := 0
+	for _, item := range items {
+		if w := lipgloss.Width(keyHintNames.Replace(item.keys)); w > keyWidth {
+			keyWidth = w
+		}
+	}
+	keyWidth++
+	if keyWidth > width-5 {
+		keyWidth = width - 5
+	}
+
+	var b strings.Builder
+	b.WriteString(helpHeadingStyle.Render(title))
+	b.WriteString("\n")
+	for i, item := range items {
+		key := helpKeyStyle.Width(keyWidth).Render(keyHintNames.Replace(item.keys))
+		b.WriteString(key + helpDescriptionStyle.Render(item.desc))
+		if i < len(items)-1 {
+			b.WriteString("\n")
+		}
+	}
+	return lipgloss.NewStyle().Width(width).Render(b.String())
+}
+
+func (m AppModel) renderHelp(innerWidth int) string {
+	columnWidth := (innerWidth - 4) / 3
+	general := renderHelpGroup("General", []helpItem{
+		{keys: "enter", desc: "comment/open"},
+		{keys: "f", desc: "file comment"},
+		{keys: "v/space", desc: "select/form"},
+		{keys: "s/t", desc: "sidebar/view"},
+		{keys: "r/R", desc: "resolve/+next"},
+		{keys: "h/H", desc: "fold/hide"},
+		{keys: "w / I", desc: "WS / images"},
+		{keys: "alt+o", desc: "open image/link"},
+		{keys: "SPC/BS·M-o·RET·esc", desc: "zoom·next·open·close"},
+		{keys: "d", desc: "delete comment"},
+		{keys: "q/C-c", desc: "submit review"},
+	}, columnWidth)
+
+	navigation := renderHelpGroup("Navigation", []helpItem{
+		{keys: "↑/↓,j/k", desc: "move"},
+		{keys: "PgUp/PgDn", desc: "half page"},
+		{keys: "shift+↑/↓,C-u/d", desc: "half page"},
+		{keys: "Home/End,g/G,</>", desc: "top/bottom"},
+		{keys: "[/]", desc: "threads/forms"},
+	}, columnWidth)
+	codeReview := renderHelpGroup("Code review / search", []helpItem{
+		{keys: "{/}", desc: "unresolved"},
+		{keys: "/ ?", desc: "search text"},
+		{keys: "M-e/g", desc: "editor/line"},
+		{keys: "M-w", desc: "copy ref"},
+		{keys: "M-p", desc: "open file"},
+		{keys: "tab/shift+tab", desc: "next/prev file"},
+		{keys: "alt+}/alt+{", desc: "next/prev file"},
+		{keys: "1-9", desc: "file tab"},
+		{keys: "n/N", desc: "diff/open/form"},
+		{keys: "↑/↓", desc: "choose file"},
+		{keys: "enter/esc", desc: "open/cancel"},
+	}, columnWidth)
+
+	columns := lipgloss.JoinHorizontal(lipgloss.Top, general, "  ", navigation, "  ", codeReview)
+	contexts := renderHelpGroup("Selection and dialogs", []helpItem{
+		{keys: "↑/↓,j/k · enter/v/esc · C-PgUp/PgDn", desc: "extend · comment/toggle/cancel selection · scroll thread"},
+		{keys: "C-s/o/v · M-s · tab/S-tab · enter/esc", desc: "save/edit/paste · suggest · focus · activate/close"},
+		{keys: "C-k/u/w,M-d · C-y/M-y · @path,tab", desc: "kill · yank · complete"},
+		{keys: "a/r/c · tab/S-tab · enter · esc · q", desc: "select approve/reject/comment · focus · submit · back · abort (outside input)"},
+		{keys: "←/→ (verdict) · ↓ · ↑ (buttons)", desc: "select approve/comment/reject · edit overall comment"},
+		{keys: "]/} · [/{ (outside input)", desc: "first thread/form item · last one; braces skip resolved; close without one"},
+		{keys: "r/esc (forms)", desc: "review/cancel"},
+		{keys: "tab · enter (dialog counters)", desc: "focus count · jump to first pending/completed item"},
+	}, innerWidth)
+
+	search := renderHelpGroup("Incremental search", []helpItem{
+		{keys: "C-s / C-r", desc: "next / previous match; repeat to wrap"},
+		{keys: "enter / esc,C-g/c", desc: "keep match / cancel and return"},
+		{keys: "backspace / C-y", desc: "undo input piece / paste kill ring"},
+		{keys: "C-d / C-w", desc: "add following character / word"},
+		{keys: "M-s i/c/w/r/m", desc: "toggle case / word / regexp / multi-file"},
+		{keys: "terminal paste", desc: "paste text into the query"},
+	}, innerWidth)
+	help := columns + "\n\n" + search + "\n\n" + contexts
+	if reviewHost() == "tmux" {
+		help += "\n\n" + renderHelpGroup("tmux controls (default bindings, 3.8+)", []helpItem{
+			{keys: "prefix @", desc: "toggle floating / tiled pane"},
+			{keys: "prefix ;", desc: "return to previous pane"},
+		}, innerWidth)
+	}
+	return help
+}
+
+func (m *AppModel) scrollHelp(delta int) {
+	lines := strings.Split(m.renderHelp(m.modalInnerWidth()), "\n")
+	header, _ := m.helpHeader(m.modalInnerWidth())
+	footer, _ := m.helpFooter(m.modalInnerWidth(), 0, 0)
+	available := max(1, m.height-modalStyle.GetVerticalFrameSize()-lipgloss.Height(header)-lipgloss.Height(footer))
+	maxOffset := max(0, len(lines)-available)
+	m.helpOffset = max(0, min(min(m.helpOffset, maxOffset)+delta, maxOffset))
+}
+
+func (m AppModel) helpFooter(width, pageSize, top int) (string, []modalMouseRegion) {
+	buttons, regions := layoutModalButtonRow([]modalButtonSpec{
+		{rendered: m.renderModalButton("Up", "↑/PgUp", false), action: modalMouseAction{scrollable: true, scrollOffset: -pageSize}},
+		{rendered: m.renderModalButton("Down", "↓/PgDn", false), action: modalMouseAction{scrollable: true, scrollOffset: pageSize}},
+	}, width, top+1)
+	brand := ansi.Truncate(BrandVersion(m.version, terminalIsDark), width, "…")
+	if lipgloss.Height(buttons) == 1 && lipgloss.Width(buttons)+2+lipgloss.Width(brand) <= width {
+		return "\n" + buttons + strings.Repeat(" ", width-lipgloss.Width(buttons)-lipgloss.Width(brand)) + brand, regions
+	}
+	return lipgloss.NewStyle().Width(width).Align(lipgloss.Right).Render(brand) + "\n" + buttons, regions
+}
+
+func (m AppModel) helpHeader(innerWidth int) (string, modalMouseRegion) {
+	title, closeRegion := modalTitleRow(modalTitleStyle.MarginBottom(0).Render("Keyboard Help  (M-? / ESC to close)"), innerWidth)
+	legend := helpLegendStyle.Render("C-: ctrl+, M-: meta/alt+, S-: shift+, RET: enter, DEL: backspace")
+	return title + "\n" + lipgloss.Wrap(legend, innerWidth, ""), closeRegion
 }
 
 func (m AppModel) renderModalButton(label, hint string, focused bool) string {
-	btn := modalBtnLabel.Render(label)
-	h := modalBtnHint.Render(hint)
-	content := btn + " " + h
 	if focused {
-		return modalBtnFocused.Render(content)
+		return renderButton(label, hint, modalBtnFocusedLabel, modalBtnFocusedKey)
 	}
-	return modalBtnNormal.Render(content)
+	return renderButton(label, hint, modalBtnNormalLabel, modalBtnNormalKey)
 }
 
-func (m AppModel) renderDeleteButton(label string, focused bool) string {
+// renderBarButton renders a button for the banner or footer.  Its label is
+// bold so it stands out from the surrounding key hints.
+func renderBarButton(label, hint string) string {
+	return renderButton(label, hint, modalBtnFocusedLabel.Bold(true), modalBtnFocusedKey)
+}
+
+// renderAccessKeyBarButton renders a bar button whose key is the first
+// letter of its label, underlining that letter instead of adding a hint.
+func renderAccessKeyBarButton(label string) string {
+	return renderAccessKey(label+" ", modalBtnFocusedLabel.Bold(true))
+}
+
+// renderAccessKey underlines the first character of label to show that it
+// is the key that triggers the control.
+func renderAccessKey(label string, style lipgloss.Style) string {
+	_, size := utf8.DecodeRuneInString(label)
+	return style.Underline(true).Render(label[:size]) + style.Padding(0).Render(label[size:])
+}
+
+func renderButton(label, hint string, labelStyle, keyStyle lipgloss.Style) string {
+	if hint == "" {
+		return labelStyle.Render(label + " ")
+	}
+	keys := strings.Split(keyHintNames.Replace(hint), " / ")
+	var renderedHint strings.Builder
+	for i, key := range keys {
+		if i > 0 {
+			renderedHint.WriteString(labelStyle.Padding(0).Render(" / "))
+		}
+		renderedHint.WriteString(keyStyle.Render(key))
+	}
+	return labelStyle.Render(label+" ") + renderedHint.String()
+}
+
+func layoutModalButtonRow(specs []modalButtonSpec, width, top int) (string, []modalMouseRegion) {
+	var row strings.Builder
+	regions := make([]modalMouseRegion, 0, len(specs))
+	x, y := 0, top
+	for _, spec := range specs {
+		buttonWidth := lipgloss.Width(spec.rendered)
+		gap := 0
+		if x > 0 {
+			gap = 2
+		}
+		if x > 0 && x+gap+buttonWidth > width {
+			row.WriteByte('\n')
+			x = 0
+			y++
+			gap = 0
+		}
+		if gap > 0 {
+			row.WriteString("  ")
+			x += gap
+		}
+		row.WriteString(spec.rendered)
+		regions = append(regions, modalMouseRegion{
+			rect: mouseRect{
+				left: x, top: y,
+				right: x + buttonWidth, bottom: y + lipgloss.Height(spec.rendered),
+			},
+			action: spec.action,
+		})
+		x += buttonWidth
+	}
+	return row.String(), regions
+}
+
+func layoutModalTextarea(before, textareaView string, width int) (string, modalMouseRegion) {
+	before = lipgloss.Wrap(before, width, "")
+	textareaView = lipgloss.Wrap(textareaView, width, "")
+	top := strings.Count(before, "\n")
+	return before + textareaView + "\n\n", modalMouseRegion{
+		rect: mouseRect{
+			left: 0, top: top,
+			right: min(width, lipgloss.Width(textareaView)), bottom: top + lipgloss.Height(textareaView),
+		},
+		action: modalMouseAction{textarea: true},
+	}
+}
+
+func renderScrollableModalBox(content string, width, maxHeight, offset int) (string, int, int) {
+	return renderModalBoxAt(content, width, maxHeight, offset, -1)
+}
+
+func renderModalBoxAt(content string, width, maxHeight, offset, initialOffset int) (string, int, int) {
+	if content == "" || maxHeight < 3 {
+		return "", 0, 0
+	}
+
+	contentWidth := max(1, width-2)
+	// Measure and render with the same tab width; lipgloss expands tabs only when rendering.
+	wrapped := lipgloss.Wrap(expandDisplayTabs(content), contentWidth, "")
+	lines := strings.Split(wrapped, "\n")
+	maxContentHeight := maxHeight - 2
+	maxOffset := max(0, len(lines)-maxContentHeight)
+	if initialOffset < 0 {
+		initialOffset = maxOffset
+	}
+	if offset < 0 {
+		offset = initialOffset
+	}
+	offset = min(offset, maxOffset)
+	moreBelow := offset+maxContentHeight < len(lines)
+	lines = lines[offset:min(len(lines), offset+maxContentHeight)]
+
+	borderStyle := lipgloss.NewStyle().Foreground(subtle)
+	topBorder, bottomBorder := strings.Repeat("─", contentWidth), strings.Repeat("─", contentWidth)
+	if offset > 0 {
+		topBorder = "↑" + strings.Repeat("─", contentWidth-1)
+	}
+	if moreBelow {
+		bottomBorder = "↓" + strings.Repeat("─", contentWidth-1)
+	}
+	top := borderStyle.Render("╭" + topBorder + "╮")
+	bottom := borderStyle.Render("╰" + bottomBorder + "╯")
+	rows := make([]string, 0, len(lines)+2)
+	rows = append(rows, top)
+	for _, line := range lines {
+		line = ansi.Truncate(line, contentWidth, "")
+		rows = append(rows, borderStyle.Render("│")+
+			lipgloss.NewStyle().Width(contentWidth).Render(line)+borderStyle.Render("│"))
+	}
+	rows = append(rows, bottom)
+
+	return strings.Join(rows, "\n"), offset, maxOffset
+}
+
+// modalMouseRegions returns the clickable regions inside the open dialog,
+// excluding the dialog frame itself.
+func (m AppModel) modalMouseRegions() []modalMouseRegion {
+	var regions []modalMouseRegion
+	if len(m.tabs) == 0 {
+		_, regions = m.renderEmptyReview()
+	} else {
+		_, layout := m.renderReviewScreen()
+		regions = layout.modalRegions
+	}
+	return slices.DeleteFunc(slices.Clone(regions), func(r modalMouseRegion) bool { return r.action.dialog })
+}
+
+// clickedModalDismiss reports whether mouse hit the dialog's close button or
+// landed outside the dialog, either of which dismisses it like esc.
+func (m AppModel) clickedModalDismiss(mouse tea.Mouse) bool {
+	_, layout := m.renderReviewScreen()
+	return dismissesModal(layout.modalRegions, mouse)
+}
+
+func dismissesModal(regions []modalMouseRegion, mouse tea.Mouse) bool {
+	inside := false
+	for _, region := range regions {
+		if !region.rect.contains(mouse) {
+			continue
+		}
+		if region.action.close {
+			return true
+		}
+		if region.action.dialog {
+			inside = true
+		}
+	}
+	return !inside
+}
+
+// modalTitleRow renders a dialog title with a close "x" at the right edge of
+// the dialog body, returning the row and the region that closes the dialog.
+func modalTitleRow(title string, width int) (string, modalMouseRegion) {
+	closeButton := closeButtonStyle.Render("x")
+	title = ansi.Truncate(title, max(0, width-1-lipgloss.Width(closeButton)), "…")
+	gap := max(1, width-lipgloss.Width(title)-lipgloss.Width(closeButton))
+	region := modalMouseRegion{
+		rect:   mouseRect{left: width - 1, right: width, bottom: 1},
+		action: modalMouseAction{close: true, focus: -1}, // not a button focus index
+	}
+	return title + strings.Repeat(" ", gap) + closeButton, region
+}
+
+// modalTitle renders a dialog title row with a close "x" followed by a blank
+// line, as modalTitleStyle's bottom margin used to provide.
+func modalTitle(text string, width int) (string, modalMouseRegion) {
+	row, region := modalTitleRow(modalTitleStyle.MarginBottom(0).Render(text), width)
+	return row + "\n", region
+}
+
+func (m AppModel) renderDeleteButton(label, hint string, focused bool) string {
+	if hint != "" {
+		keyStyle := modalBtnNormalKey
+		if focused {
+			keyStyle = modalBtnFocusedKey
+			return modalDeleteBtnFocused.PaddingRight(0).Render(label+" ") + keyStyle.Render(hint)
+		}
+		return modalBtnNormal.PaddingRight(0).Render(modalDeleteBtnLabel.Render(label+" ")) + keyStyle.Render(hint)
+	}
 	if focused {
 		return modalDeleteBtnFocused.Render(label)
 	}
 	return modalBtnNormal.Render(modalDeleteBtnLabel.Render(label))
 }
 
-func (m AppModel) renderContextPreview(start, end, maxWidth int) string {
+func (m AppModel) renderContextPreview(side string, start, end, maxWidth, maxLines int) string {
 	t := m.tabs[m.activeTab]
 	if t.doc == nil {
 		return ""
@@ -1874,8 +4371,11 @@ func (m AppModel) renderContextPreview(start, end, maxWidth int) string {
 	if maxLineText < 10 {
 		maxLineText = 10
 	}
-	for i := start; i <= end && i <= t.doc.LineCount(); i++ {
-		lineText := t.doc.LineAt(i)
+	for i := start; i <= end; i++ {
+		lineText := displaySourceText(m.anchorText(&t, side, i, i))
+		if lineText == "" {
+			continue
+		}
 		wrapped := lipgloss.Wrap(lineText, maxLineText, "")
 		num := lineNumStyle.Render(fmt.Sprintf("%d", i))
 		wrapLines := strings.Split(wrapped, "\n")
@@ -1887,74 +4387,288 @@ func (m AppModel) renderContextPreview(start, end, maxWidth int) string {
 			}
 		}
 	}
-	if len(lines) > 8 {
-		lines = append(lines[:7], footerStyle.Render(fmt.Sprintf("  ... +%d more lines", len(lines)-7)))
+	if maxLines > 0 && len(lines) > maxLines {
+		lines = append(lines[:maxLines-1], footerStyle.Render("  ... +"+countNoun(len(lines)-maxLines+1, "more line", "more lines")))
 	}
 	return strings.Join(lines, "\n")
 }
 
 func (m AppModel) renderWithModal(background string) string {
+	rendered, _ := m.renderWithModalLayout(background)
+	return rendered
+}
+
+func (m AppModel) renderWithModalLayout(background string) (string, []modalMouseRegion) {
+	frameStyle := modalStyle
+	switch m.modal {
+	case commentModal, fileCommentModal, replyModal, editModal:
+		frameStyle = frameStyle.BorderForeground(commentFocusedBorderColor)
+	}
 	var modalContent string
-	modalWidth := m.width * 2 / 3
-	if modalWidth < 50 {
-		modalWidth = 50
-	}
-	if modalWidth > m.width-4 {
-		modalWidth = m.width - 4
-	}
+	var regions []modalMouseRegion
+	bgW := lipgloss.Width(background)
+	bgH := lipgloss.Height(background)
+	modalWidth := m.modalWidth()
 	innerWidth := modalWidth - 6
 
 	switch m.modal {
+	case gotoLineModal, openSourceModal:
+		content, locationRegions := m.locationModalContent(innerWidth)
+		regions = append(regions, locationRegions...)
+		modalContent = frameStyle.Width(modalWidth).Render(content)
+
+	case fileSelectModal:
+		// Size the list for the whole tab set, which is fixed while it is open.
+		content, fileRegions := m.fileSelectModalContent(innerWidth, min(len(m.tabs), 20, max(3, bgH-12)))
+		regions = append(regions, fileRegions...)
+		modalContent = frameStyle.Width(modalWidth).Render(content)
+
+	case helpModal:
+		header, closeRegion := m.helpHeader(innerWidth)
+		regions = append(regions, closeRegion)
+		lines := strings.Split(m.renderHelp(innerWidth), "\n")
+		footer, _ := m.helpFooter(innerWidth, 0, 0)
+		available := max(1, bgH-frameStyle.GetVerticalFrameSize()-lipgloss.Height(header)-lipgloss.Height(footer))
+		offset := max(0, min(m.helpOffset, len(lines)-available))
+		body := strings.Join(lines[offset:min(len(lines), offset+available)], "\n")
+		prefix := header + "\n" + body + "\n"
+		footer, scrollRegions := m.helpFooter(innerWidth, available, strings.Count(prefix, "\n"))
+		regions = append(regions, scrollRegions...)
+		content := prefix + footer
+		modalContent = frameStyle.Width(modalWidth).Render(content)
+
 	case commentModal:
 		start, end := m.selectionRange()
-		var title string
+		side := m.selectionSide()
+		titleText := fmt.Sprintf("Add Comment (line %d)", start)
 		if start != end {
-			title = modalTitleStyle.Render(fmt.Sprintf("Add Comment (lines %d-%d)", start, end))
-		} else {
-			title = modalTitleStyle.Render(fmt.Sprintf("Add Comment (line %d)", start))
+			titleText = fmt.Sprintf("Add Comment (lines %d-%d)", start, end)
 		}
-		contextBox := contextBoxStyle.
-			Width(innerWidth - 2).
-			Render(m.renderContextPreview(start, end, innerWidth-4))
+		title, closeRegion := modalTitle(titleText, innerWidth)
+		contextContent := m.renderContextPreview(side, start, end, innerWidth-4, 0)
+		buttonSpecs := []modalButtonSpec{
+			{rendered: m.renderModalButton("Save", "C-s", m.modalFocus == 1), action: modalMouseAction{focus: 1}},
+			{rendered: m.renderModalButton("Close", "esc", m.modalFocus == 2), action: modalMouseAction{focus: 2}},
+		}
+		if m.canSuggest() {
+			buttonSpecs = append(buttonSpecs, modalButtonSpec{
+				rendered: m.renderModalButton("Suggest", "M-s", m.modalFocus == 3),
+				action:   modalMouseAction{focus: 3},
+			})
+		}
 
-		saveBtn := m.renderModalButton("Save", "ctrl+s", m.modalFocus == 1)
-		cancelBtn := m.renderModalButton("Cancel", "esc", m.modalFocus == 2)
-		buttons := lipgloss.JoinHorizontal(lipgloss.Center, saveBtn, "  ", cancelBtn)
+		buildContent := func(contextSection string, scrollOffset, scrollMaxOffset int) (string, []modalMouseRegion) {
+			content := title + "\n"
+			var contentRegions []modalMouseRegion
+			if contextSection != "" {
+				contextTop := strings.Count(content, "\n")
+				content += contextSection + "\n\n"
+				contentRegions = append(contentRegions, modalMouseRegion{
+					rect: mouseRect{
+						left: 0, top: contextTop,
+						right: lipgloss.Width(contextSection), bottom: contextTop + lipgloss.Height(contextSection),
+					},
+					action: modalMouseAction{
+						scrollable: true, scrollOffset: scrollOffset, scrollMaxOffset: scrollMaxOffset,
+					},
+				})
+			}
+			content, textareaRegion := layoutModalTextarea(content, m.clipboardTextareaView(), innerWidth)
+			contentRegions = append(contentRegions, textareaRegion)
+			buttons, buttonRegions := layoutModalButtonRow(buttonSpecs, innerWidth, strings.Count(content, "\n"))
+			content += buttons
+			contentRegions = append(contentRegions, buttonRegions...)
+			return content, contentRegions
+		}
 
-		modalContent = modalStyle.Width(modalWidth).Render(
-			title + "\n" + contextBox + "\n\n" + m.modalTextarea.View() + "\n\n" + buttons)
+		fixedContent, _ := buildContent("", 0, 0)
+		fixedHeight := lipgloss.Height(frameStyle.Width(modalWidth).Render(fixedContent))
+		contextHeight := max(3, bgH-fixedHeight-3)
+		contextSection, scrollOffset, scrollMaxOffset := renderScrollableModalBox(
+			contextContent, innerWidth-2, contextHeight, m.modalReferenceOffset)
+		content, contentRegions := buildContent(contextSection, scrollOffset, scrollMaxOffset)
+		modalContent = frameStyle.Width(modalWidth).Render(content)
+		regions = append(regions, contentRegions...)
+		regions = append(regions, closeRegion)
 
-	case editModal:
-		title := modalTitleStyle.Render("Edit Comment")
-		var contextSection string
+	case fileCommentModal:
+		title, closeRegion := modalTitle("Add File Comment", innerWidth)
+		path := contextBoxStyle.Width(innerWidth - 2).Render(m.tab().displayPath())
+		prefix, textareaRegion := layoutModalTextarea(
+			title+"\n"+path+"\n\n", m.clipboardTextareaView(), innerWidth)
+		regions = append(regions, textareaRegion)
+		buttons, buttonRegions := layoutModalButtonRow([]modalButtonSpec{
+			{rendered: m.renderModalButton("Save", "C-s", m.modalFocus == 1), action: modalMouseAction{focus: 1}},
+			{rendered: m.renderModalButton("Close", "esc", m.modalFocus == 2), action: modalMouseAction{focus: 2}},
+		}, innerWidth, strings.Count(prefix, "\n"))
+		regions = append(regions, buttonRegions...)
+		regions = append(regions, closeRegion)
+		modalContent = frameStyle.Width(modalWidth).Render(prefix + buttons)
+
+	case replyModal, editModal:
+		titleText := "Edit Comment"
+		if m.modal == replyModal {
+			titleText = "Add Reply"
+		} else if m.editingReplyID != "" {
+			titleText = "Edit Reply"
+		}
+		title, closeRegion := modalTitle(titleText, innerWidth)
+		if m.hasModalResolution() {
+			comment, _ := m.driftedComment(m.editingID)
+			checkbox := renderResolution(comment.Resolved, "Resolved", false) + " " + modalBtnNormalKey.Render("M-r")
+			checkboxWidth := lipgloss.Width(checkbox)
+			left := max(0, innerWidth-checkboxWidth-3)
+			title = ansi.Truncate(modalTitleStyle.MarginBottom(0).Render(titleText), max(0, left-1), "…")
+			title = lipgloss.NewStyle().Width(left).Render(title) + checkbox + "  " + closeButtonStyle.Render("x") + "\n"
+			regions = append(regions, modalMouseRegion{
+				rect:   mouseRect{left: left, right: left + checkboxWidth, bottom: 1},
+				action: modalMouseAction{resolve: true},
+			})
+		}
+		var referenceContent string
+		var thread threadLayout
+		var threadStart int
 		for _, c := range m.tabs[m.activeTab].state.Comments {
 			if c.ID == m.editingID {
-				start := c.Line
-				end := c.EndLine
-				if end == 0 {
-					end = start
+				if commentDrifted(m.tab(), c) {
+					referenceContent = driftedContext(c)
+				} else if isGeneralCommentScope(c.Scope) {
+					referenceContent = m.tab().displayPath()
+				} else {
+					start := c.StartLine
+					end := c.EndAt()
+					referenceContent = m.renderContextPreview(c.Side, start, end, innerWidth-4, 0)
 				}
-				contextSection = contextBoxStyle.
-					Width(innerWidth - 2).
-					Render(m.renderContextPreview(start, end, innerWidth-4))
+				if m.modal == replyModal || m.editingReplyID != "" {
+					thread = m.layoutThread(c.Author, c.Body, c.Replies, m.editingReplyID, innerWidth-4)
+					if referenceContent != "" {
+						referenceContent = lipgloss.Wrap(referenceContent, max(1, innerWidth-4), "")
+						threadStart = strings.Count(referenceContent, "\n") + 2
+						referenceContent += "\n\n"
+					}
+					referenceContent += strings.Join(thread.lines, "\n")
+				}
 				break
 			}
 		}
-		saveBtn := m.renderModalButton("Save", "ctrl+s", m.modalFocus == 1)
-		cancelBtn := m.renderModalButton("Cancel", "esc", m.modalFocus == 2)
-		deleteBtn := m.renderDeleteButton("Delete", m.modalFocus == 3)
-		buttons := lipgloss.JoinHorizontal(lipgloss.Center, saveBtn, "  ", cancelBtn, "  ", deleteBtn)
-
-		content := title + "\n"
-		if contextSection != "" {
-			content += contextSection + "\n\n"
+		buttonSpecs := []modalButtonSpec{
+			{rendered: m.renderModalButton("Save", "C-s", m.modalFocus == 1), action: modalMouseAction{focus: 1}},
+			{rendered: m.renderModalButton("Close", "esc", m.modalFocus == 2), action: modalMouseAction{focus: 2}},
 		}
-		content += m.modalTextarea.View() + "\n\n" + buttons
-		modalContent = modalStyle.Width(modalWidth).Render(content)
-	}
+		if m.canSuggest() {
+			buttonSpecs = append(buttonSpecs, modalButtonSpec{
+				rendered: m.renderModalButton("Suggest", "M-s", m.modalFocus == 3),
+				action:   modalMouseAction{focus: 3},
+			})
+		}
 
-	bgW := lipgloss.Width(background)
-	bgH := lipgloss.Height(background)
+		buildContent := func(referenceSection string, scrollOffset, scrollMaxOffset int) (string, []modalMouseRegion) {
+			content := title + "\n"
+			var contentRegions []modalMouseRegion
+			if referenceSection != "" {
+				referenceTop := strings.Count(content, "\n")
+				content += referenceSection + "\n\n"
+				contentRegions = append(contentRegions, modalMouseRegion{
+					rect: mouseRect{
+						left: 0, top: referenceTop,
+						right: lipgloss.Width(referenceSection), bottom: referenceTop + lipgloss.Height(referenceSection),
+					},
+					action: modalMouseAction{
+						scrollable: true, scrollOffset: scrollOffset, scrollMaxOffset: scrollMaxOffset,
+					},
+				})
+			}
+			content, textareaRegion := layoutModalTextarea(content, m.clipboardTextareaView(), innerWidth)
+			contentRegions = append(contentRegions, textareaRegion)
+			buttonY := strings.Count(content, "\n")
+			buttonRow, buttonRegions := layoutModalButtonRow(buttonSpecs, innerWidth, buttonY)
+			content += buttonRow
+			contentRegions = append(contentRegions, buttonRegions...)
+			buttonY += lipgloss.Height(buttonRow)
+			deleteStart := m.modalDeleteStartFocus()
+			for i, target := range m.modalDeleteTargets() {
+				content += "\n"
+				deleteRow, deleteRegions := layoutModalButtonRow([]modalButtonSpec{{
+					rendered: m.renderDeleteButton(target.label, "", m.modalFocus == i+deleteStart),
+					action:   modalMouseAction{focus: i + deleteStart, deleteIndex: i},
+				}}, innerWidth, buttonY)
+				content += deleteRow
+				contentRegions = append(contentRegions, deleteRegions...)
+				buttonY += lipgloss.Height(deleteRow)
+			}
+			return content, contentRegions
+		}
+
+		fixedContent, _ := buildContent("", 0, 0)
+		fixedHeight := lipgloss.Height(frameStyle.Width(modalWidth).Render(fixedContent))
+		referenceHeight := max(3, min(18, bgH-fixedHeight-3))
+		initialOffset := -1
+		if len(thread.starts) > 0 {
+			initialOffset = threadStart + thread.initialOffset(referenceHeight-2)
+		}
+		if _, drifted := m.driftedComment(m.editingID); drifted && len(thread.starts) == 0 {
+			initialOffset = 0
+		}
+		referenceSection, scrollOffset, scrollMaxOffset := renderModalBoxAt(
+			referenceContent, innerWidth-2, referenceHeight, m.modalReferenceOffset, initialOffset)
+		content, contentRegions := buildContent(referenceSection, scrollOffset, scrollMaxOffset)
+		modalContent = frameStyle.Width(modalWidth).Render(content)
+		regions = append(regions, contentRegions...)
+		regions = append(regions, closeRegion)
+
+	case discardChangesModal:
+		title, closeRegion := modalTitle("Discard changes?", innerWidth)
+		info := "Your unsaved comment changes will be lost."
+		prefix := lipgloss.Wrap(title+"\n"+info+"\n\n", innerWidth, "")
+		buttons, buttonRegions := layoutModalButtonRow([]modalButtonSpec{
+			{rendered: m.renderModalButton("Discard", "y", m.modalFocus == 0), action: modalMouseAction{focus: 0}},
+			{rendered: m.renderModalButton("Keep Editing", "n / esc", m.modalFocus == 1), action: modalMouseAction{focus: 1}},
+		}, innerWidth, strings.Count(prefix, "\n"))
+		regions = append(regions, buttonRegions...)
+		regions = append(regions, closeRegion)
+		modalContent = frameStyle.Width(modalWidth).Render(prefix + buttons)
+
+	case deleteConfirmModal:
+		titleText := "Delete comment?"
+		if targets := m.modalDeleteTargets(); m.pendingDelete >= 0 && m.pendingDelete < len(targets) && targets[m.pendingDelete].replyID != "" {
+			titleText = "Delete reply?"
+		}
+		title, closeRegion := modalTitle(titleText, innerWidth)
+		info := "This cannot be undone."
+		prefix := lipgloss.Wrap(title+"\n"+info+"\n\n", innerWidth, "")
+		buttons, buttonRegions := layoutModalButtonRow([]modalButtonSpec{
+			{rendered: m.renderDeleteButton("Delete", "y", m.modalFocus == 0), action: modalMouseAction{focus: 0}},
+			{rendered: m.renderModalButton("Keep", "n / esc", m.modalFocus == 1), action: modalMouseAction{focus: 1}},
+		}, innerWidth, strings.Count(prefix, "\n"))
+		regions = append(regions, buttonRegions...)
+		regions = append(regions, closeRegion)
+		modalContent = frameStyle.Width(modalWidth).Render(prefix + buttons)
+
+	case finishAbortModal:
+		frameStyle = frameStyle.BorderForeground(finishColor(review.VerdictReject))
+		content, abortRegions := m.finishAbortContent(innerWidth)
+		regions = append(regions, abortRegions...)
+		modalContent = frameStyle.Width(modalWidth).Render(content)
+	case finishResolveModal:
+		frameStyle = frameStyle.BorderForeground(success)
+		content, resolveRegions := m.finishResolveContent(innerWidth)
+		regions = append(regions, resolveRegions...)
+		modalContent = frameStyle.Width(modalWidth).Render(content)
+	case finishFormsModal:
+		frameStyle = frameStyle.BorderForeground(lipgloss.Yellow)
+		content, formRegions := m.finishFormsContent(innerWidth)
+		regions = append(regions, formRegions...)
+		modalContent = frameStyle.Width(modalWidth).Render(content)
+	case finishModal:
+		frameStyle = frameStyle.BorderForeground(m.finishAttentionColor())
+		content, finishRegions := m.finishModalContent(innerWidth)
+		regions = append(regions, finishRegions...)
+		modalContent = frameStyle.Width(modalWidth).Render(content)
+	case lightboxModal:
+		content, width, lightboxRegions := m.lightboxContent()
+		regions = append(regions, lightboxRegions...)
+		modalContent = frameStyle.Width(width).Render(content)
+	}
 
 	modalW := lipgloss.Width(modalContent)
 	modalH := lipgloss.Height(modalContent)
@@ -1964,40 +4678,84 @@ func (m AppModel) renderWithModal(background string) string {
 	if mx < 0 {
 		mx = 0
 	}
-	if my < 0 {
+	if modalH > bgH && (m.modal == commentModal || m.modal == replyModal || m.modal == editModal) {
+		my = bgH - modalH
+	} else if my < 0 {
 		my = 0
 	}
+	contentX := mx + frameStyle.GetBorderLeftSize() + frameStyle.GetPaddingLeft()
+	contentY := my + frameStyle.GetBorderTopSize() + frameStyle.GetPaddingTop()
+	for i := range regions {
+		regions[i].rect.left += contentX
+		regions[i].rect.right += contentX
+		regions[i].rect.top += contentY
+		regions[i].rect.bottom += contentY
+	}
+	regions = append(regions, modalMouseRegion{
+		rect:   mouseRect{left: mx, top: my, right: mx + modalW, bottom: my + modalH},
+		action: modalMouseAction{dialog: true},
+	})
 
 	background = dimRendered(background, bgW, bgH)
 
-	bgLayer := lipgloss.NewLayer(background)
-	modalLayer := lipgloss.NewLayer(modalContent).X(mx).Y(my).Z(1)
+	layers := []*lipgloss.Layer{
+		lipgloss.NewLayer(background),
+		lipgloss.NewLayer(modalContent).X(mx).Y(my).Z(1),
+	}
+	if menu := m.completionLayer(regions, bgW, bgH); menu != nil {
+		layers = append(layers, menu)
+	}
+	return lipgloss.NewCompositor(layers...).Render(), regions
+}
 
-	comp := lipgloss.NewCompositor(bgLayer, modalLayer)
-	return comp.Render()
+func (m AppModel) modalWidth() int {
+	width := m.width * 2 / 3
+	if m.modal == helpModal {
+		width = m.width - 4
+	}
+	return max(10, min(max(50, width), m.width-4))
+}
+
+func (m AppModel) modalInnerWidth() int {
+	return m.modalWidth() - 6
 }
 
 func dimRendered(s string, w, h int) string {
 	canvas := lipgloss.NewCanvas(w, h)
 	canvas.Compose(lipgloss.NewLayer(s))
 
-	dim := lipgloss.Color("#555555")
+	// Backgrounds are dimmed too, so text on a gray background stays
+	// distinguishable from the dimmed foreground.  Light terminals dim
+	// toward white so the dialog still stands out from a pale page.
+	ld := lipgloss.LightDark(terminalIsDark)
+	dim := ld(lipgloss.Color("#aaaaaa"), lipgloss.Color("#555555"))
+	dimBg := ld(lipgloss.Color("#dddddd"), lipgloss.Color("#2a2a2a"))
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
 			cell := canvas.CellAt(x, y)
-			if cell != nil {
-				cell.Style.Fg = dim
+			if cell == nil {
+				continue
+			}
+			cell.Style.Fg = dim
+			if cell.Style.Bg != nil {
+				cell.Style.Bg = dimBg
 			}
 		}
 	}
 	return canvas.Render()
 }
 
-// clampLines truncates text to maxLines and appends "…" if truncated.
-func clampLines(text string, maxLines int) string {
-	lines := strings.Split(text, "\n")
-	if len(lines) <= maxLines {
-		return text
+// countNoun formats n with the noun in the matching number.
+func countNoun(n int, singular, plural string) string {
+	if n == 1 {
+		return "1 " + singular
 	}
-	return strings.Join(lines[:maxLines], "\n") + "…"
+	return fmt.Sprintf("%d %s", n, plural)
+}
+
+func reviewHost() string {
+	if host, ok := os.LookupEnv("CRITTY_HOST"); ok {
+		return host
+	}
+	return os.Getenv("TCRIT_HOST")
 }

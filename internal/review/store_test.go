@@ -4,142 +4,280 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
-
-	"github.com/kevindutra/crit/internal/document"
 )
 
-func TestStoreRoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	origDir, _ := os.Getwd()
-	os.Chdir(dir)
-	defer os.Chdir(origDir)
-
-	docPath := filepath.Join(dir, "plan.md")
-	os.WriteFile(docPath, []byte("# Test\n"), 0644)
-
-	document.EnsureDirs()
-
-	// Load returns empty state for new file
-	state, err := Load(docPath)
+func TestLegacyRoundStateMigration(t *testing.T) {
+	state := RoundState{
+		Verdict: VerdictComment, ReviewCommentDraft: "draft", Finished: true,
+		Files:            map[string]SnapshotFile{"a.md": {Content: "original"}},
+		SubmittedReplies: []string{},
+	}
+	encoded, err := json.Marshal(state)
 	if err != nil {
-		t.Fatalf("loading: %v", err)
+		t.Fatal(err)
 	}
-	if len(state.Comments) != 0 {
-		t.Error("expected no comments")
+	for _, key := range []string{"tcrit_state", "critty_state"} {
+		var cj CritJSON
+		input := `{"review_round":3,"files":{},"` + key + `":` + string(encoded) + `}`
+		if err := json.Unmarshal([]byte(input), &cj); err != nil {
+			t.Fatal(err)
+		}
+		if cj.ReviewRound != 3 || !reflect.DeepEqual(cj.RoundState, state) {
+			t.Fatalf("state lost: %+v", cj)
+		}
+		output, err := json.Marshal(cj)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(output), "critty_state") {
+			t.Fatalf("wrong saved key: %s", output)
+		}
+		var legacyReader struct {
+			State RoundState `json:"tcrit_state"`
+		}
+		if err := json.Unmarshal(output, &legacyReader); err != nil || !reflect.DeepEqual(legacyReader.State, state) {
+			t.Fatalf("old reader lost state: %+v, %v", legacyReader.State, err)
+		}
+		var reloaded CritJSON
+		if err := json.Unmarshal(output, &reloaded); err != nil || !reflect.DeepEqual(cj, reloaded) {
+			t.Fatalf("round trip lost data: %+v, %v", reloaded, err)
+		}
+	}
+	for _, current := range []string{`{}`, `null`} {
+		var cj CritJSON
+		input := `{"critty_state":` + current + `,"tcrit_state":{"review_comment_draft":"old"}}`
+		if err := json.Unmarshal([]byte(input), &cj); err != nil || cj.RoundState.ReviewCommentDraft != "" {
+			t.Fatalf("legacy overrides current: %+v, %v", cj, err)
+		}
+	}
+}
+
+func setupStateDir(t *testing.T) {
+	t.Helper()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+}
+
+func TestSessionRoundTrip(t *testing.T) {
+	setupStateDir(t)
+	if err := os.WriteFile("plan.md", []byte("# Test\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
-	// Add comment and save
-	state.AddComment(Comment{ID: "c1", Line: 1, Body: "test comment", })
-	if err := Save(state); err != nil {
+	sess, err := OpenDocSession("", "plan.md")
+	if err != nil {
+		t.Fatalf("opening session: %v", err)
+	}
+	if got := len(sess.FileComments("plan.md")); got != 0 {
+		t.Errorf("expected no comments, got %d", got)
+	}
+	if sess.CJ.ReviewRound != 1 {
+		t.Errorf("expected review round 1, got %d", sess.CJ.ReviewRound)
+	}
+
+	now := Now()
+	multiline := "First line.\nSecond line.\nThird line."
+	comment := Comment{
+		ID: "c_abc123", StartLine: 1, EndLine: 1, Anchor: "# Test",
+		Body: multiline, Author: "Tester", Scope: "line",
+		CreatedAt: now, UpdatedAt: now, ReviewRound: 1,
+	}
+	sess.SetFileComments("plan.md", "", []Comment{comment})
+	if err := sess.Save(); err != nil {
 		t.Fatalf("saving: %v", err)
 	}
 
-	// Verify file is YAML
-	reviewPath := document.ReviewPath(docPath)
-	if !strings.HasSuffix(reviewPath, ".yaml") {
-		t.Errorf("expected .yaml extension, got %s", reviewPath)
-	}
-	data, err := os.ReadFile(reviewPath)
+	data, err := os.ReadFile(sess.Path())
 	if err != nil {
 		t.Fatalf("reading review file: %v", err)
 	}
-	content := string(data)
-	if strings.Contains(content, "{") {
-		t.Error("review file looks like JSON, expected YAML")
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("review file is not valid JSON: %v", err)
+	}
+	if _, ok := raw["files"]; !ok {
+		t.Error("review file missing files map")
 	}
 
-	// Reload and verify
-	loaded, err := Load(docPath)
+	reloaded, err := OpenDocSession("", "plan.md")
 	if err != nil {
-		t.Fatalf("reloading: %v", err)
+		t.Fatalf("reopening: %v", err)
 	}
-	if len(loaded.Comments) != 1 {
-		t.Fatalf("expected 1 comment, got %d", len(loaded.Comments))
+	comments := reloaded.FileComments("plan.md")
+	if len(comments) != 1 {
+		t.Fatalf("expected 1 comment, got %d", len(comments))
 	}
-	if loaded.Comments[0].Body != "test comment" {
-		t.Errorf("comment body mismatch: %s", loaded.Comments[0].Body)
+	c := comments[0]
+	if c.Body != multiline {
+		t.Errorf("body mismatch:\ngot:  %q\nwant: %q", c.Body, multiline)
+	}
+	if c.Author != "Tester" || c.Anchor != "# Test" || c.Scope != "line" {
+		t.Errorf("field mismatch: %+v", c)
 	}
 }
 
-func TestMultilineBody(t *testing.T) {
-	dir := t.TempDir()
-	origDir, _ := os.Getwd()
-	os.Chdir(dir)
-	defer os.Chdir(origDir)
+func TestSessionUpdatePreservesConcurrentReplies(t *testing.T) {
+	setupStateDir(t)
 
-	docPath := filepath.Join(dir, "plan.md")
-	os.WriteFile(docPath, []byte("# Test\n"), 0644)
+	sess, err := OpenSession("", "0123456789ab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess.SetFileComments("a.go", "", []Comment{
+		{ID: "c_first", Body: "first"},
+		{ID: "c_second", Body: "second"},
+	})
+	if err := sess.Save(); err != nil {
+		t.Fatal(err)
+	}
 
-	document.EnsureDirs()
+	first, err := OpenSession("", sess.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenSession("", sess.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	state, _ := Load(docPath)
-	multiline := "First line.\nSecond line.\nThird line."
-	state.AddComment(Comment{ID: "c1", Line: 1, Body: multiline, })
-	if err := Save(state); err != nil {
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	update := func(s *Session, id, body string) {
+		<-start
+		errs <- s.Update(func(s *Session) error {
+			return s.AppendReply(id, body, "AI", "", false, "")
+		})
+	}
+	go update(first, "c_first", "first reply")
+	go update(second, "c_second", "second reply")
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("updating session: %v", err)
+		}
+	}
+
+	reloaded, err := OpenSession("", sess.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	comments := reloaded.FileComments("a.go")
+	if len(comments) != 2 {
+		t.Fatalf("comments = %+v, want two", comments)
+	}
+	if len(comments[0].Replies) != 1 || comments[0].Replies[0].Body != "first reply" {
+		t.Errorf("first reply lost: %+v", comments[0].Replies)
+	}
+	if len(comments[1].Replies) != 1 || comments[1].Replies[0].Body != "second reply" {
+		t.Errorf("second reply lost: %+v", comments[1].Replies)
+	}
+}
+
+func TestSessionKeyPathNormalization(t *testing.T) {
+	setupStateDir(t)
+	if err := os.WriteFile("plan.md", []byte("# Test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rel, err := OpenDocSession("", "plan.md")
+	if err != nil {
+		t.Fatalf("opening with relative path: %v", err)
+	}
+	cwd, _ := os.Getwd()
+	abs, err := OpenDocSession("", filepath.Join(cwd, "plan.md"))
+	if err != nil {
+		t.Fatalf("opening with absolute path: %v", err)
+	}
+	if rel.Key != abs.Key {
+		t.Errorf("relative and absolute paths yield different keys: %s vs %s", rel.Key, abs.Key)
+	}
+	dotted, err := OpenDocSession("", "./plan.md")
+	if err != nil {
+		t.Fatalf("opening with dotted path: %v", err)
+	}
+	if rel.Key != dotted.Key {
+		t.Errorf("dotted path yields a different key: %s vs %s", rel.Key, dotted.Key)
+	}
+}
+
+func TestSessionKeyDistinctPerMode(t *testing.T) {
+	cwd := "/tmp/project"
+	doc := SessionKey(cwd, "", []string{"plan.md"})
+	git := SessionKey(cwd, "main", nil)
+	other := SessionKey(cwd, "topic", nil)
+	if doc == git {
+		t.Error("files-mode and git-mode keys should differ")
+	}
+	if git == other {
+		t.Error("keys should differ across branches")
+	}
+	if len(doc) != 12 || !isHex(doc) {
+		t.Errorf("expected 12 hex chars, got %q", doc)
+	}
+}
+
+func isHex(s string) bool {
+	return strings.IndexFunc(s, func(r rune) bool {
+		return !strings.ContainsRune("0123456789abcdef", r)
+	}) < 0
+}
+
+func TestUnresolvedComments(t *testing.T) {
+	cj := NewCritJSON()
+	cj.ReviewComments = []Comment{
+		{ID: "r_1", Scope: "review"},
+		{ID: "r_2", Scope: "review", Resolved: true},
+	}
+	cj.Files["a.go"] = CritJSONFile{Comments: []Comment{
+		{ID: "c_1"},
+		{ID: "c_2", Resolved: true},
+		{ID: "c_3"},
+	}}
+	if got := cj.TotalComments(); got != 5 {
+		t.Errorf("TotalComments = %d, want 5", got)
+	}
+	if got := cj.UnresolvedComments(); got != 3 {
+		t.Errorf("UnresolvedComments = %d, want 3", got)
+	}
+}
+
+func TestSessionClearRemovesFolderAndRegistryEntry(t *testing.T) {
+	setupStateDir(t)
+	if err := os.WriteFile("plan.md", []byte("# Test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sess, err := OpenDocSession("", "plan.md")
+	if err != nil {
+		t.Fatalf("opening session: %v", err)
+	}
+	sess.SetFileComments("plan.md", "", []Comment{{ID: "c_abc123", StartLine: 1, EndLine: 1, Body: "x"}})
+	if err := sess.Save(); err != nil {
 		t.Fatalf("saving: %v", err)
 	}
 
-	// Verify YAML uses block scalar (no \n escapes)
-	data, _ := os.ReadFile(document.ReviewPath(docPath))
-	content := string(data)
-	if strings.Contains(content, `\n`) {
-		t.Error("YAML should not contain escaped newlines")
-	}
-
-	// Round-trip preserves multiline
-	loaded, err := Load(docPath)
+	entries, err := ListSessionEntries()
 	if err != nil {
-		t.Fatalf("reloading: %v", err)
+		t.Fatalf("listing sessions: %v", err)
 	}
-	if loaded.Comments[0].Body != multiline {
-		t.Errorf("multiline body mismatch:\ngot:  %q\nwant: %q", loaded.Comments[0].Body, multiline)
+	if len(entries) != 1 || entries[0].Key != sess.Key {
+		t.Fatalf("expected one registry entry for %s, got %+v", sess.Key, entries)
 	}
-}
 
-func TestMigrationFromJSON(t *testing.T) {
-	dir := t.TempDir()
-	origDir, _ := os.Getwd()
-	os.Chdir(dir)
-	defer os.Chdir(origDir)
-
-	docPath := filepath.Join(dir, "plan.md")
-	os.WriteFile(docPath, []byte("# Test\n"), 0644)
-
-	document.EnsureDirs()
-
-	// Write a legacy JSON review file
-	state := &ReviewState{
-		File: docPath,
-		Comments: []Comment{
-			{ID: "legacy1", Line: 1, Body: "old comment", },
-		},
+	if err := sess.Clear(); err != nil {
+		t.Fatalf("clearing: %v", err)
 	}
-	yamlPath := document.ReviewPath(docPath)
-	jsonPath := strings.TrimSuffix(yamlPath, ".yaml") + ".json"
-	jsonData, _ := json.MarshalIndent(state, "", "  ")
-	os.WriteFile(jsonPath, jsonData, 0644)
-
-	// Load should find JSON, migrate to YAML, delete JSON
-	loaded, err := Load(docPath)
+	if _, err := os.Stat(sess.Dir); !os.IsNotExist(err) {
+		t.Error("review folder should be removed")
+	}
+	entries, err = ListSessionEntries()
 	if err != nil {
-		t.Fatalf("loading with migration: %v", err)
+		t.Fatalf("listing sessions after clear: %v", err)
 	}
-	if len(loaded.Comments) != 1 {
-		t.Fatalf("expected 1 comment after migration, got %d", len(loaded.Comments))
-	}
-	if loaded.Comments[0].Body != "old comment" {
-		t.Errorf("comment body mismatch after migration: %s", loaded.Comments[0].Body)
-	}
-
-	// JSON file should be deleted
-	if _, err := os.Stat(jsonPath); !os.IsNotExist(err) {
-		t.Error("legacy JSON file should have been deleted after migration")
-	}
-
-	// YAML file should exist
-	if _, err := os.Stat(yamlPath); os.IsNotExist(err) {
-		t.Error("YAML file should exist after migration")
+	if len(entries) != 0 {
+		t.Errorf("expected no registry entries, got %+v", entries)
 	}
 }
