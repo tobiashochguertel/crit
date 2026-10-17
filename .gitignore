@@ -150,3 +150,22 @@ wheels/
 yarn-debug.log*
 yarn-error.log*
 yarn.lock
+
+# Upstream additions (kept from upstream merge)
+# Built binary
+/critty
+/crit
+
+# Demo videos recorded on demand, and the temporary tapes that record them
+/demo/*.gif
+/demo/*.mp4
+/demo/.*.mp4.tape
+
+# Maintainer notes for agents, kept outside the repository
+/AGENTS.local.md
+
+# Local Claude Code config
+.claude/
+
+# Local Gemini config
+.gemini/

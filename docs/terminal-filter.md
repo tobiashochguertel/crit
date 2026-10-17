@@ -1,0 +1,30 @@
+# Codex terminal discovery and the filter interface
+
+Codex 0.157.0 and later run shell tools from a background server, so Critty cannot find the tmux or Herdr pane from the process tree.  The bundled `codex` wrapper and `critty codex` register the pane instead, and each review round locates a marker displayed by the Critty skill.  This page describes that mechanism and the interface for terminal filters that report the marker directly.
+
+## How a round finds its pane
+
+Before each Codex review round, the Critty skill runs `critty terminal prepare`, displays the returned marker, and adds `--terminal-request <id>` to the review command.  Critty first checks for a terminal-filter notification.  Otherwise it searches only the visible text in panes with live wrapper registrations, using their recorded server sockets and pane IDs.  It does not enumerate all multiplexer instances or read scrollback.  A missing, unreadable, or ambiguous match fails without opening a review in a guessed pane.  Keep the marker visible and use a terminal wide enough to display it on one line.
+
+Registrations and short-lived requests are stored under `$XDG_STATE_HOME/critty/terminals` (default `~/.local/state/critty/terminals`).  Critty links the current and legacy state paths to keep older launchers and active registrations usable.  If linking is unavailable or the directories conflict, it continues using the legacy directory.  Registrations include the launcher PID and process start time; stale processes are discarded during lookup.  A request expires after two minutes and is consumed when its destination is selected.  Prepare a fresh marker for every round or retry, including a saved `--session` review.  Pane text is never saved or returned to the agent.
+
+The wrapper and Critty must run on the same host with the same state directory, and Critty needs access to the multiplexer socket.  When both tmux and Herdr are present, the wrapper uses process ancestry to select the nearer pane.  If registration fails, it prints a warning and still starts Codex unchanged.  Resume from the intended terminal through the wrapper after installing it; an already-running Codex process has no registration.  The daemon's inherited PATH may differ from your current shell.
+
+## Terminal filter notification interface
+
+Filters such as tfil can avoid pane text searches by reporting a marker they observe in the agent's terminal output.  [tfil](https://github.com/knu/tfil) 0.4.1 and later support this with `--critty-notify`.  Add that option to your tfil launch or generated Codex wrapper and restart the wrapped session.  Wrappers generated with the older `--tcrit-notify` option also report Critty markers with tfil 0.4.1, while TCrit's `TCRIT-` markers still go to `tcrit`.  The filter is optional; without it, Critty searches the visible text in registered panes.
+
+- Protocol v1 marker: `CRITTY-` followed by exactly 32 lowercase hexadecimal characters.  Extract the complete marker across output chunks and terminal escape sequences; the hexadecimal suffix is the request ID.  Inspect rendered output rather than assuming one PTY read equals one line.
+- On detection, execute `critty terminal notify <request-id>` as an argument vector, inheriting the filter's original terminal environment and the same `XDG_STATE_HOME` as Critty.  Use `TMUX` and `TMUX_PANE`, or `HERDR_SOCKET_PATH`, `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, and `HERDR_PANE_ID`.  Run this from the filter, not from a daemon-backed agent shell.
+- The prepare command creates the inbox before the marker is displayed.  Notification may precede the review command; no running receiver process is required.  Notifications have priority over pane text matches.  Critty allows a short delivery/settling interval before selecting a target.
+- Exit 0 means accepted (including a repeated report from the same pane).  Invalid, expired, or consumed requests return nonzero.  Report each marker once; do not block or change the terminal stream on a rejected report.  Distinct pane notifications received before selection make the request ambiguous.  Reports arriving after consumption are rejected.
+- This is local routing, not authentication or remote control.  Neither the marker nor other pane text is executed.  This protocol works with `tfil → critty wrapper → codex` and `critty wrapper → tfil → codex` because the inbox is found by request ID, not process parentage.
+
+
+## Client hints and remote connections
+
+Notifications also work outside tmux and Herdr.  Preserve the filter's original `SSH_CONNECTION`, `SSH_CLIENT`, `SSH_TTY`, `TERMINAL_APP`, `TERM_PROGRAM`, `ITERM_SESSION_ID`, `WT_SESSION`, and `WSL_DISTRO_NAME` when present.  tfil already snapshots its environment before starting the child and passes that snapshot to the callback.  No extra options or callback arguments are required.  A child that clears or changes its environment must not change the callback's origin.
+
+Critty saves only the positive SSH bit, normalized terminal application, WSL distribution, and source PID/start time.  It never persists SSH addresses.  Notifications identify their filter parent, while wrapper registrations identify the process that becomes Codex through `exec`.  Old registrations without hints remain usable.  Duplicate reports for the same multiplexer pane are accepted; different panes, or different filter processes outside a multiplexer, remain ambiguous.  A wrapper registration outside a multiplexer cannot scan a native terminal screen; use a notifying filter there.
+
+Built-in GUI launchers skip a known SSH connection.  A unique current tmux client's session environment can override stale wrapper hints after reattachment; process ancestry recognizes `sshd` and `sshd-session`, not outbound `ssh` clients.  Unavailable metadata is unknown and does not prohibit GUI launch.  With a prepared marker, Critty uses the matched origin instead of the daemon's inherited terminal hints.  `critty env` exposes sanitized `CRITTY_SSH=1` and `CRITTY_TERMINAL_APP` hints to custom launchers.

@@ -1,172 +1,246 @@
+# Critty
+
 <p align="center">
-  <img src="assets/crit_logo.png" alt="crit" width="300">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/critty-logo-dark-boxed.svg">
+    <img src="assets/critty-logo-light-boxed.svg" alt="critty" width="400">
+  </picture><br>
+  <a href="https://github.com/crittylabs/critty/releases/latest"><img src="https://img.shields.io/github/v/release/crittylabs/critty" alt="Latest release"></a>
+  <a href="https://github.com/crittylabs/critty/actions/workflows/ci.yml"><img src="https://github.com/crittylabs/critty/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
 </p>
 
-# Crit
+Review code, refine plans, make choices, and approve actions with your coding agent in the terminal.
 
-A terminal-based review tool for documents and code. Read a plan or review code changes across multiple files, leave inline comments, and let Claude Code address your feedback automatically.
+You can review a diff, file, or document on its own.  Your agent can also attach a document asking for your permission or a decision.  You can agree in advance on which actions need your approval, such as pushing code or deploying.
 
-Built for the human-in-the-loop workflow: Claude writes code or a plan, you review it in a TUI, Claude reads your comments and makes changes.
+When your agent needs your input, it prepares the request and opens the review in Critty.  You can comment on individual lines, use checkboxes to confirm details or allow actions, and choose options with radio buttons.  Your comments and answers go back to the agent.
 
-![crit code review demo](demo/code-review.gif)
+For example:
+
+- Review code changes alongside screenshots and questions from your agent.
+- Leave inline feedback on a plan or document.
+- Choose an implementation approach before coding starts.
+- Check a proposed PR's text and destination before authorizing publication.
+
+![An approval checklist with required confirmations and an inline image](https://github.com/user-attachments/assets/d22e2123-92f9-400d-8b35-f20f4c010db2)
+
+[More videos and screenshots](#gallery).
+
+> **critty** is the new name of crit, originally published as `kevindutra/crit`, with the fixes and improvements developed as TCrit; see [CHANGELOG.md](CHANGELOG.md) for every change since crit 0.2.2.
+
+## Key Features
+
+- **Code and document reviews** — read multi-file diffs and documents with syntax highlighting and inline comments.
+- **Approvals and choices** — read requests in attached documents, confirm details or allow actions with checkboxes, and choose between alternatives with radio buttons.  These requests can accompany a code review or stand on their own.
+- **Round trips with your agent** — send feedback and answers, let the agent act on them, and return for the next round.  Integrations support Claude Code, Codex, OpenCode, and Antigravity CLI; legacy Gemini CLI is also available.
+- **Flexible review inputs** — review Git changes, commit ranges, supplied diffs, or versioned plans.
+- **Inline image previews** — compare image changes, preview images while writing comments, and inspect local images in a zoomable lightbox.  [See an image review](#reviewing-an-image-replacement).
+- **Navigation and editing** — browse files, search as you type, reply to comments, and edit in your preferred editor.
+- **Mouse and keyboard** — use vim-style keys or clickable tabs, comments, and controls.
+- **Scriptable and Crit-compatible** — automate comments with a [Crit](https://crit.md/)-compatible review format and resume saved sessions.
 
 ## Install
 
-### Claude Code Plugin Marketplace (recommended)
-
-crit is available as a Claude Code plugin. Add the marketplace and install:
-
-```
-/plugin marketplace add kevindutra/crit
-/plugin install crit
-```
-
-Then use `/crit:review` in Claude Code. It will ask whether you want to review code changes or a document, open the TUI, and after you close it, Claude reads your comments and makes changes.
-
-### From source
+Install the binary with [mise](https://mise.jdx.dev/):
 
 ```bash
-go install github.com/kevindutra/crit/cmd/crit@latest
+mise install github:crittylabs/critty
 ```
 
-Make sure `$GOPATH/bin` (defaults to `~/go/bin`) is in your `PATH`:
+Or with Go, with `$GOPATH/bin` on your `PATH`:
 
 ```bash
-export PATH="$PATH:$(go env GOPATH)/bin"
+go install github.com/crittylabs/critty/cmd/critty@latest
 ```
 
-### Manual skill install
+Release binaries are available for macOS and Linux on amd64 and arm64.  Building from source requires Go 1.27.2 or later.
 
-If you prefer not to use the plugin, you can install the skill directly:
+### Check prerequisites
+
+After installing the binary, run:
 
 ```bash
-crit setup-claude          # Install globally (~/.claude/skills/)
-crit setup-claude --project # Install for current project only
+critty doctor
 ```
 
-Then use `/crit-review <path>` in Claude Code for document reviews, or `/crit-code-review` for multi-file code reviews.
+Run it in the terminal where you plan to use Critty.  It checks installed agent integrations, review launchers, image settings, and Python/MCP prerequisites for optional AI reviews.  Follow its suggestions for the features you plan to use, then rerun it after setup.
 
-## Requirements
+### Agent skills
 
-- **Go 1.21+** for building from source
-- **tmux** — required for the Claude Code integration. Crit opens the review TUI in a tmux split pane next to Claude Code.
+<a id="antigravity-cli"></a>
 
-### Starting a tmux session
+Install the skills for your agent.  The table shows how to start a review; use `critty-approval` for approvals and choices:
 
-If you're not already in tmux, start one before launching Claude Code:
+| Agent | Install for your user | Start a review |
+| --- | --- | --- |
+| Claude Code | `critty install --user claude-code` | `/critty` |
+| Codex | `critty install --user codex` | `$critty` |
+| OpenCode | `critty install --user opencode` | `/critty` |
+| Antigravity CLI | `critty install --user agy` | `/critty` |
+| Gemini CLI | `critty install --user gemini` | Ask it to use the `critty` skill |
+
+The `agy` target also accepts `antigravity`.  Omit `--user` to install for the current project.  Use `critty install agents` for shared skills, or `critty install all` for all agent-specific integrations except legacy Gemini CLI.  Choose shared skills or agent-specific variants to avoid duplicate skill names.
+
+Rerun the installer after upgrading.  In v1.2.0, Codex skills use `.codex/skills` in projects and `~/.codex/skills` for users; remove obsolete copies from `.agents/skills` if needed.  When migrating from TCrit, use the new binary and skill names; see the [changelog](CHANGELOG.md) for migration details.
+
+After installing or upgrading the skills, run `critty doctor` from your project to check for missing or outdated integration files.
+
+### Terminals and multiplexers
+
+Floating panes require tmux 3.8 or later; older servers use split panes.  Desktop terminal windows are not opened over SSH, so use tmux or Herdr for agent reviews, or run Critty directly.
+
+After setting up or switching your terminal or multiplexer, run `critty doctor` there to check review launchers and local image forwarding settings.  See the [launcher reference](internal/cli/skill/critty-cli/SKILL.md#review-launchers) for configuration and supported terminals.
+
+#### Image previews
+
+Image previews need a terminal with Kitty graphics protocol support and Unicode image placeholders, such as Kitty, Ghostty, or iTerm2.  Through tmux or Herdr, enable image passthrough; for tmux, run `tmux set -g allow-passthrough on`.
+
+After enabling passthrough, run `critty doctor` in the foreground of that terminal to probe image support and check forwarding settings.  Herdr checks read local configuration; running server and remote client settings may differ.
+
+PNG, JPEG, GIF, and WebP are supported.  Large or unsupported images and changed images in supplied diffs remain text placeholders; remote image URLs are not fetched.
+
+<a id="codex-with-a-background-server"></a>
+
+### Using Codex in tmux or Herdr
+
+When using Codex in tmux or Herdr, start it through Critty so reviews can find the correct terminal:
 
 ```bash
-tmux new -s work
-# Now launch Claude Code inside this tmux session
-claude
+critty codex
 ```
 
-If you forget, crit will tell you — but the split-pane review won't work outside of tmux.
+Alternatively, put the bundled `codex` wrapper ahead of Codex on your `PATH`.  Run `critty doctor` to inspect wrapper and terminal-filter detection.  For an end-to-end binding test, use the [marker-based doctor check](internal/cli/skill/critty-cli/SKILL.md#environment-diagnostics).  See [terminal-filter integration](docs/terminal-filter.md) for setup.
 
-## Code Review (multi-file)
+## Basic workflow
+
+### Review code and documents
+
+Ask your agent to use the `critty` skill to review its changes, a plan, or a document.  For example:
+
+> Use critty to review these changes before committing.
+
+Critty opens in a tmux floating pane, a Herdr tab, or a new window of a supported terminal emulator when neither is running.  Read the diff or document, leave inline comments on the relevant lines, and submit Approve, Reject, or Comment.
+
+The agent reads your verdict and comments, makes revisions, and reopens the same session.  You can read its replies and the updated changes, add feedback, and continue until the work is ready.
+
+<video controls src="https://github.com/user-attachments/assets/2842e136-b0bd-4a4f-9c66-d5a22ed52ea3"></video>
+
+For a manual review:
 
 ```bash
-crit review --code
+critty                    # Current Git changes
+critty --staged            # Staged changes
+critty notes.md            # A document
+critty plan design.md      # A versioned plan
+critty status              # Saved reviews
+critty --session <id>      # Resume a saved review
 ```
 
-Detects changed files in your git repo and opens a tabbed TUI with syntax highlighting, diff markers, and inline commenting across all changed files.
+<a id="review-navigation"></a>
 
-- Diffs against unstaged changes by default, falls back to `HEAD~1` or `main`
-- Green gutter markers highlight changed lines
-- Comments are aggregated across all files in the session
+Reviews support mouse and keyboard navigation, search, inline comments, and your preferred editor.  Progress indicators highlight unresolved feedback and unanswered items.  Use the in-app Help for controls and `critty --help` for commands.  The [CLI reference](internal/cli/skill/critty-cli/SKILL.md) covers review inputs, attachments, saved sessions, configuration, and scripted comments.
+
+<a id="approvals-and-choices"></a>
+
+### Review code and approve the next actions
+
+Agree with your agent on which actions need your approval, such as committing, pushing a branch, or deploying.  Keep your project rules for reviews, approvals, and choices in `CLAUDE.md` or `AGENTS.md`.
+
+When it needs your permission or a decision, the agent can use [critty-approval](internal/cli/skill/critty-approval/SKILL.md) to prepare a document with the details and open it in Critty.  That document can be attached to the same session as the diff, so you can review the changes and next steps together.  It can include the proposed commit message, push destination, or deployment plan.
+
+For example:
+
+> Use critty-approval to review these changes and the proposed push together.  Include the commit message and exact repository and branch destination, and wait for my approval before pushing.
+
+For a deployment, include the target environment and exact deployment actions alongside the changes.  Review the code and proposed operations together, leave feedback where needed, and approve the operations you want the agent to carry out.
+
+Required confirmations must be complete before approval.  Approving the review does not authorize operations whose permission checkboxes remain unchecked.  Critty records your decisions; the agent executes the authorized actions.
+
+### Approvals and choices without a code diff
+
+The agent can also open a request document on its own, without a code diff.  Use the same `critty-approval` skill to choose an approach before implementation starts or approve an action that has no code changes to review:
+
+> Use critty-approval to let me choose between these implementation approaches.
+>
+> Use critty-approval to show me the PR text and destination before publishing it.
+
+Read the request and supporting material, leave comments, and use the checkboxes or radio buttons to give your answers.  Submit your decision, and the agent continues from your feedback and answers.  The installed skills handle the interaction with Critty.
+
+### AI review and collaboration (Experimental)
+
+Request a second opinion with [critty-ai-review](internal/cli/skill/critty-ai-review/SKILL.md), or use [critty-ai-cowork](internal/cli/skill/critty-ai-cowork/SKILL.md) to let your agent address findings with another AI before your final review.  Findings return to the same Critty comment threads.
+
+For example:
+
+> Use critty-ai-review with Codex Astra to review these changes in the current session.
+
+AI review requires an existing Critty session and authorized access to the chosen reviewer.  The bundled restricted CLI setups support Claude Code with Python 3.10+, or Codex with Python 3.11+ and the MCP Python SDK.  See the linked skills for setup and dependencies.
+
+Before your first AI review, run `critty doctor` to check Python and MCP prerequisites.  If the reviewer uses a dedicated Python environment, check that interpreter explicitly:
 
 ```bash
-# Get all code review comments as JSON
-crit status --code
+critty doctor --python /absolute/path/to/venv/bin/python
 ```
 
-### How code review works
+If you installed the earlier `crit-ai-review` or `crit-ai-cowork` skills, reinstall with `critty install --force <agent>` to update them.
 
-1. Run `crit review --code` — crit detects changed files and opens the tabbed TUI
-2. Navigate between files and leave inline comments on the changes
-3. Quit the TUI — comments are saved to `.crit/`
-4. `crit status --code` outputs all comments across files as JSON
-5. Claude (or any tool) reads the comments and edits the files
+## Gallery
 
-## Document Review (single file)
+Recorded with the v1.2.0 candidate.
 
-```bash
-crit review docs/plans/my-plan.md
-```
+### Code review with inline comments
 
-Opens a full-screen terminal UI with syntax-highlighted markdown, a comment sidebar, and modal overlays for adding/editing comments.
+<video controls src="https://github.com/user-attachments/assets/2842e136-b0bd-4a4f-9c66-d5a22ed52ea3"></video>
 
-### tmux split pane mode
+### Review round trips with Claude Code
 
-When running inside tmux, you can open the TUI in a side-by-side split pane:
+<video controls src="https://github.com/user-attachments/assets/b78ebf6f-c406-44cd-b56d-b1793031f5b9"></video>
 
-```bash
-# Open review in a tmux split and return immediately
-crit review docs/plan.md --detach
+### Review round trips with Codex
 
-# Open review in a tmux split and block until it closes
-crit review docs/plan.md --detach --wait
-```
+<video controls src="https://github.com/user-attachments/assets/4e86ed2e-65c1-4aed-a499-e4d57e3736e2"></video>
 
-This is how the Claude Code skill invokes crit — `--detach --wait` is a single blocking call that opens the TUI next to Claude Code and waits for you to finish reviewing.
+### Asking Codex Astra for a review from Claude Code
 
-### How document review works
+A comment in a Claude Code review requests a second opinion from Codex Astra.  Claude starts the reviewer, and Astra's inline findings and overall report return to the same Critty session.
 
-1. Claude writes a plan (or you open any markdown file)
-2. `crit review <path>` opens the TUI — read through and leave inline comments
-3. Comments are stored as JSON in a local `.crit/` directory (gitignored by default)
-4. `crit status <path>` outputs comments as JSON for Claude (or any tool) to consume
-5. Claude reads the comments, edits the document, and you can re-review
+<video controls src="https://github.com/user-attachments/assets/1e8f2467-27fb-4a83-9685-9aedc40e1c8d"></video>
 
-## Keybindings
+### Reviewing a document
 
-| Key | Action |
-|-----|--------|
-| `j` / `k` | Scroll down / up |
-| `ctrl+d` / `ctrl+u` | Half page down / up |
-| `g` / `G` | Jump to top / bottom |
-| `enter` | Add comment at current line |
-| `v` | Visual select mode (multi-line comments) |
-| `s` | Toggle comment sidebar |
-| `[` / `]` | Jump to prev / next comment |
-| `q` | Save & quit |
+<video controls src="https://github.com/user-attachments/assets/d8cf18f7-aa1d-4985-a993-f4c522eaf28c"></video>
 
-**Code review only:**
+### Previewing an image while writing a comment
 
-| Key | Action |
-|-----|--------|
-| `tab` / `shift+tab` | Next / previous file tab |
-| `n` / `N` | Jump to next / previous change |
-| `/` | Search file tabs |
+![Image preview beneath a comment draft in Ghostty](https://github.com/user-attachments/assets/5576979d-7943-4ae4-9578-37a9e01d8508)
 
-## Scriptable CLI
+### Inspecting an attached image in the lightbox
 
-```bash
-# Add a comment programmatically
-crit comment docs/plan.md --line 15 --body "This needs more detail"
+![Lightbox showing a local image from an attached Markdown document](https://github.com/user-attachments/assets/af8b4612-b968-49d1-b18a-e0b3d3a6350a)
 
-# Multi-line comment
-crit comment docs/plan.md --line 10 --end-line 20 --body "Rethink this section"
+### Reviewing an image replacement
 
-# Get review comments as JSON (single file)
-crit status docs/plan.md
+![Before and After image previews in Ghostty](https://github.com/user-attachments/assets/76064e2d-e9f1-4c07-ae5d-4f7f3f1a16a7)
 
-# Get all code review comments as JSON
-crit status --code
-```
+### Attached checklist with an inline image
 
-## Shell Completions
+![Attached review checklist with required confirmations, clickable checkboxes, and an inline image](https://github.com/user-attachments/assets/d22e2123-92f9-400d-8b35-f20f4c010db2)
 
-```bash
-# Bash
-crit completion bash > /etc/bash_completion.d/crit
+### Review progress and pending items
 
-# Zsh
-crit completion zsh > "${fpath[1]}/_crit"
+![Actionable counters, tab markers, and a thread on an attached checklist in Ghostty](https://github.com/user-attachments/assets/8e52ed1c-3854-4786-9a9a-950efe4e79a7)
 
-# Fish
-crit completion fish > ~/.config/fish/completions/crit.fish
-```
+### Submitting with unfinished items
+
+![Submit dialog warning about unresolved threads and unanswered required and optional items](https://github.com/user-attachments/assets/67093884-2089-4044-8b7e-2b9d2fbed91b)
+
+### Incremental search
+
+![Incremental search highlights matches while an inline image remains visible](https://github.com/user-attachments/assets/c87a24e4-dbea-4c1f-996b-0cad6844d306)
+
+## Contributing
+
+Contributions and ideas are welcome: support for more agent CLIs and multiplexers, terminal compatibility, keyboard and mouse interaction, UI improvements, and workflows that use AI.  [Open an issue](https://github.com/crittylabs/critty/issues) to suggest an improvement or send a [pull request](https://github.com/crittylabs/critty/pulls).
 
 ## Development
 
@@ -176,6 +250,10 @@ go build ./...
 go vet ./...
 ```
 
+Run `python3 e2e/scenarios.py` for isolated CLI and TUI scenarios, and `python3 e2e/doctor_images_test.py` for image diagnostics.  These checks need Python and tmux, but no AI accounts.
+
+See [demo/README.md](demo/README.md) for recording and publishing demos.
+
 ## License
 
-MIT
+[MIT](LICENSE)

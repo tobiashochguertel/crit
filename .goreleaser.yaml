@@ -1,10 +1,23 @@
 version: 2
+project_name: critty
 
 builds:
-  - main: ./cmd/crit/
-    binary: crit
+  - id: critty
+    main: ./cmd/critty/
+    binary: critty
     ldflags:
-      - -s -w -X main.version={{.Version}}
+      - -s -w -X github.com/crittylabs/critty/internal/cli.version=v{{.Version}}
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+  - id: codex
+    main: ./cmd/codex/
+    binary: codex
+    ldflags:
+      - -s -w
     goos:
       - darwin
       - linux
@@ -13,22 +26,10 @@ builds:
       - arm64
 
 archives:
-  - format: tar.gz
+  - formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
 
-brews:
-  - repository:
-      owner: kevindutra
-      name: homebrew-tap
-    homepage: "https://github.com/kevindutra/crit"
-    description: "Terminal review tool for markdown documents"
-    license: "MIT"
-    install: |
-      bin.install "crit"
-
-changelog:
-  sort: asc
-  filters:
-    exclude:
-      - "^docs:"
-      - "^test:"
+# The release workflow supplies the matching CHANGELOG.md section with --release-notes.
+release:
+  use_existing_draft: true
+  mode: replace
